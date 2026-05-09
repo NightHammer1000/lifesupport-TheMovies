@@ -54,6 +54,19 @@ typedef struct IMediaEventVtbl_DS {
     HRESULT (STDMETHODCALLTYPE *FreeEventParams)(void*, long, LONG_PTR, LONG_PTR);
 } IMediaEventVtbl_DS;
 
+/* IMediaEventSink vtable — its own type so the Notify slot has the proper
+   3-argument signature. Sharing IGraphBuilder's vtable for IMediaEventSink
+   is a calling-convention bug: AddFilter pops 12 bytes (this + pFilter + pName)
+   but Notify pushes 16 (this + EventCode + p1 + p2). The 4-byte mismatch
+   corrupts the caller's stack frame and produces a deterministic crash in
+   qedit.dll on the very first writer-graph Notify. */
+typedef struct IMediaEventSinkVtbl_DS {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(void*);
+    ULONG   (STDMETHODCALLTYPE *Release)(void*);
+    HRESULT (STDMETHODCALLTYPE *Notify)(void*, long, LONG_PTR, LONG_PTR);
+} IMediaEventSinkVtbl_DS;
+
 #define MAX_GRAPH_FILTERS 8
 
 typedef struct FakeGraph {
@@ -64,10 +77,12 @@ typedef struct FakeGraph {
     IMediaSeekingVtbl_DS    *lpMediaSeekingVtbl;   /* 12 */
     void                    *lpMediaPositionVtbl;  /* 16 — IMediaPositionVtbl_FG* */
     IBasicAudioVtbl_DS      *lpBasicAudioVtbl;     /* 20 */
-    LONG                     ref_count;             /* 24 */
+    IMediaEventSinkVtbl_DS  *lpMediaEventSinkVtbl; /* 24 */
+    LONG                     ref_count;             /* 28 */
 
     /* Filters added to this graph */
     IBaseFilter_DS          *filters[MAX_GRAPH_FILTERS];
+    WCHAR                    filter_names[MAX_GRAPH_FILTERS][128];
     int                      filter_count;
 
     /* Our source filter (set when WMAsfReader is added) */
@@ -91,10 +106,13 @@ typedef struct FakeGraph {
 #define GRAPH_FROM_MS(p)  ((FakeGraph*)((BYTE*)(p) - offsetof(FakeGraph, lpMediaSeekingVtbl)))
 #define GRAPH_FROM_MP(p)  ((FakeGraph*)((BYTE*)(p) - offsetof(FakeGraph, lpMediaPositionVtbl)))
 #define GRAPH_FROM_BA(p)  ((FakeGraph*)((BYTE*)(p) - offsetof(FakeGraph, lpBasicAudioVtbl)))
+#define GRAPH_FROM_MES(p) ((FakeGraph*)((BYTE*)(p) - offsetof(FakeGraph, lpMediaEventSinkVtbl)))
 
 /* ========== Forward decls ========== */
 static IMediaControlVtbl_DS g_FGMediaControlVtbl;
-static IMediaEventVtbl_DS g_FGMediaEventVtbl;
+/* g_FGMediaEventVtbl is a macro defined later (see ME_* section) — it's
+   actually a void*[20] array so we can pad past the 13 IMediaEvent slots
+   if the game ever indexes into IMediaEventEx territory. */
 static IMediaSeekingVtbl_DS g_FGMediaSeekingVtbl;
 static IBasicAudioVtbl_DS g_FGBasicAudioVtbl;
 
@@ -125,11 +143,21 @@ static IMediaPositionVtbl_FG g_FGMediaPositionVtbl;
 static const GUID IID_IMediaControl =
     {0x56A868B1, 0x0AD4, 0x11CE, {0xB0,0x3A,0x00,0x20,0xAF,0x0B,0xA7,0x70}};
 
+/* IID for IMediaEventSink: {56A868A2-0AD4-11CE-B03A-0020AF0BA770}
+   Still queried on FakeGraph by passthrough'd CGB2 during writer-path
+   graph builds; we hand back our dedicated MES vtable so Notify dispatch
+   has the correct __stdcall pop size (3-arg, not the 2-arg AddFilter). */
+static const GUID IID_IMediaEventSink =
+    {0x56A868A2, 0x0AD4, 0x11CE, {0xB0,0x3A,0x00,0x20,0xAF,0x0B,0xA7,0x70}};
+
 /* ========== IGraphBuilder (QI, AddRef, Release + graph methods) ========== */
 
 static HRESULT STDMETHODCALLTYPE FG_QI(IBaseFilter_DS *This, REFIID riid, void **ppv) {
     FakeGraph *g = (FakeGraph*)This;
-    TRACE_MSG("FG::QI({%08lX-%04X})", riid->Data1, riid->Data2);
+    TRACE_MSG("FG::QI({%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X})",
+        riid->Data1, riid->Data2, riid->Data3,
+        riid->Data4[0], riid->Data4[1], riid->Data4[2], riid->Data4[3],
+        riid->Data4[4], riid->Data4[5], riid->Data4[6], riid->Data4[7]);
 
     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IGraphBuilder)) {
         *ppv = This; goto ok;
@@ -151,12 +179,24 @@ static HRESULT STDMETHODCALLTYPE FG_QI(IBaseFilter_DS *This, REFIID riid, void *
     if (IsEqualGUID(riid, &IID_IBasicAudio)) {
         *ppv = &g->lpBasicAudioVtbl; goto ok;
     }
-    /* Also accept IFilterGraph, IFilterGraph2 */
-    if (riid->Data1 == 0x56A8689F || riid->Data1 == 0x56A868A2) {
+    /* IFilterGraph (Data1=0x56A8689F) — same vtable layout as IGraphBuilder
+       through slot 10 (SetDefaultSyncSource), so handing back FakeGraph itself
+       works. (IFilterGraph2 is GUID 36B73882-..., NOT 56A868A2.) */
+    if (riid->Data1 == 0x56A8689F) {
         *ppv = This; goto ok;
     }
+    /* IMediaEventSink — its own vtable. Sharing FakeGraph's IGraphBuilder
+       vtable would alias slot[3] Notify(this, code, p1, p2) onto AddFilter
+       (this, pFilter, pName), causing a 4-byte __stdcall pop mismatch and
+       deterministic stack corruption in the caller (qedit.dll). */
+    if (IsEqualGUID(riid, &IID_IMediaEventSink)) {
+        *ppv = &g->lpMediaEventSinkVtbl; goto ok;
+    }
 
-    proxy_log("  -> E_NOINTERFACE");
+    proxy_log("  -> E_NOINTERFACE for {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        riid->Data1, riid->Data2, riid->Data3,
+        riid->Data4[0], riid->Data4[1], riid->Data4[2], riid->Data4[3],
+        riid->Data4[4], riid->Data4[5], riid->Data4[6], riid->Data4[7]);
     *ppv = NULL;
     return E_NOINTERFACE;
 ok:
@@ -183,9 +223,9 @@ static ULONG STDMETHODCALLTYPE FG_Release(IBaseFilter_DS *This) {
     return ref;
 }
 
-/* IMediaEventSink::Notify — the TEXTURERENDERER calls this on EndOfStream.
-   Because IMediaEventSink[3] maps to IFilterGraph[3] (AddFilter), the renderer's
-   Notify(EC_COMPLETE, 0, 0) hits AddFilter with pFilter=1. We detect this and handle it. */
+/* IMediaEventSink::Notify — receives event notifications from filters
+   (EC_COMPLETE, EC_TIMECODE_AVAILABLE etc.). Dispatched through a dedicated
+   vtable so the __stdcall pop size matches what the caller pushed. */
 static HRESULT STDMETHODCALLTYPE FG_EventSinkNotify(IBaseFilter_DS *This, long EventCode, LONG_PTR p1, LONG_PTR p2) {
     FakeGraph *g = (FakeGraph*)This;
     proxy_log("FakeGraph::EventSinkNotify(code=%ld, p1=%ld, p2=%ld)", EventCode, p1, p2);
@@ -194,6 +234,23 @@ static HRESULT STDMETHODCALLTYPE FG_EventSinkNotify(IBaseFilter_DS *This, long E
     }
     return S_OK;
 }
+
+/* ===== IMediaEventSink (dedicated vtable, slot[3] = Notify with 3 args) ===== */
+static HRESULT STDMETHODCALLTYPE MES_QI(void *t, REFIID r, void **p) {
+    return FG_QI((IBaseFilter_DS*)GRAPH_FROM_MES(t), r, p);
+}
+static ULONG STDMETHODCALLTYPE MES_AddRef(void *t) {
+    return FG_AddRef((IBaseFilter_DS*)GRAPH_FROM_MES(t));
+}
+static ULONG STDMETHODCALLTYPE MES_Release(void *t) {
+    return FG_Release((IBaseFilter_DS*)GRAPH_FROM_MES(t));
+}
+static HRESULT STDMETHODCALLTYPE MES_Notify(void *t, long EventCode, LONG_PTR p1, LONG_PTR p2) {
+    return FG_EventSinkNotify((IBaseFilter_DS*)GRAPH_FROM_MES(t), EventCode, p1, p2);
+}
+static IMediaEventSinkVtbl_DS g_FGMediaEventSinkVtbl = {
+    MES_QI, MES_AddRef, MES_Release, MES_Notify
+};
 
 /* IGraphBuilder methods */
 static HRESULT STDMETHODCALLTYPE FG_AddFilter(IBaseFilter_DS *This, IBaseFilter_DS *pFilter, LPCWSTR pName) {
@@ -210,7 +267,14 @@ static HRESULT STDMETHODCALLTYPE FG_AddFilter(IBaseFilter_DS *This, IBaseFilter_
 
     if (g->filter_count < MAX_GRAPH_FILTERS) {
         pFilter->lpVtbl->AddRef(pFilter);
-        g->filters[g->filter_count++] = pFilter;
+        int idx = g->filter_count++;
+        g->filters[idx] = pFilter;
+        if (pName) {
+            wcsncpy(g->filter_names[idx], pName, 127);
+            g->filter_names[idx][127] = 0;
+        } else {
+            g->filter_names[idx][0] = 0;
+        }
     }
 
     /* Detect our source filter vs the game's texture renderer */
@@ -271,15 +335,149 @@ static HRESULT STDMETHODCALLTYPE FG_Render(IBaseFilter_DS *This, IPin_DS *pPin) 
     return S_OK;
 }
 
-/* Stubs for unused IGraphBuilder methods */
-static HRESULT STDMETHODCALLTYPE FG_RemoveFilter(void *t, void *f) { proxy_log("FakeGraph::RemoveFilter()"); return S_OK; }
-static HRESULT STDMETHODCALLTYPE FG_EnumFilters(void *t, void **pp) { proxy_log("FakeGraph::EnumFilters()"); return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE FG_FindFilterByName(void *t, LPCWSTR n, void **pp) { proxy_log("FakeGraph::FindFilterByName(%ls)", n?n:L"null"); return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE FG_ConnectDirect(void *t, void *a, void *b, void *c) { proxy_log("FakeGraph::ConnectDirect()"); return E_NOTIMPL; }
+/* IEnumFilters — small COM object that walks our filters[] array */
+typedef struct IEnumFiltersVtbl_DS {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(void*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(void*);
+    ULONG   (STDMETHODCALLTYPE *Release)(void*);
+    HRESULT (STDMETHODCALLTYPE *Next)(void*, ULONG, IBaseFilter_DS**, ULONG*);
+    HRESULT (STDMETHODCALLTYPE *Skip)(void*, ULONG);
+    HRESULT (STDMETHODCALLTYPE *Reset)(void*);
+    HRESULT (STDMETHODCALLTYPE *Clone)(void*, void**);
+} IEnumFiltersVtbl_DS;
+
+typedef struct {
+    IEnumFiltersVtbl_DS *lpVtbl;
+    LONG                 ref;
+    FakeGraph           *graph;       /* AddRef'd */
+    int                  cursor;
+} EnumFilters;
+
+static IEnumFiltersVtbl_DS g_EnumFiltersVtbl;
+static const GUID IID_IEnumFilters =
+    {0x56A86893, 0x0AD4, 0x11CE, {0xB0,0x3A,0x00,0x20,0xAF,0x0B,0xA7,0x70}};
+
+static HRESULT STDMETHODCALLTYPE EF_QI(void *t, REFIID r, void **p) {
+    EnumFilters *e = (EnumFilters*)t;
+    if (IsEqualGUID(r, &IID_IUnknown) || IsEqualGUID(r, &IID_IEnumFilters)) {
+        *p = e; InterlockedIncrement(&e->ref); return S_OK;
+    }
+    *p = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE EF_AddRef(void *t) {
+    return InterlockedIncrement(&((EnumFilters*)t)->ref);
+}
+static ULONG STDMETHODCALLTYPE EF_Release(void *t) {
+    EnumFilters *e = (EnumFilters*)t;
+    LONG r = InterlockedDecrement(&e->ref);
+    if (r == 0) {
+        FG_Release((IBaseFilter_DS*)e->graph);
+        free(e);
+    }
+    return r;
+}
+static HRESULT STDMETHODCALLTYPE EF_Next(void *t, ULONG count, IBaseFilter_DS **out, ULONG *fetched) {
+    EnumFilters *e = (EnumFilters*)t;
+    ULONG n = 0;
+    while (n < count && e->cursor < e->graph->filter_count) {
+        IBaseFilter_DS *f = e->graph->filters[e->cursor++];
+        f->lpVtbl->AddRef(f);
+        out[n++] = f;
+    }
+    if (fetched) *fetched = n;
+    return (n == count) ? S_OK : S_FALSE;
+}
+static HRESULT STDMETHODCALLTYPE EF_Skip(void *t, ULONG count) {
+    EnumFilters *e = (EnumFilters*)t;
+    e->cursor += count;
+    if (e->cursor > e->graph->filter_count) {
+        e->cursor = e->graph->filter_count;
+        return S_FALSE;
+    }
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE EF_Reset(void *t) {
+    ((EnumFilters*)t)->cursor = 0;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE EF_Clone(void *t, void **pp) {
+    EnumFilters *src = (EnumFilters*)t;
+    EnumFilters *dst = calloc(1, sizeof(*dst));
+    if (!dst) { *pp = NULL; return E_OUTOFMEMORY; }
+    dst->lpVtbl = &g_EnumFiltersVtbl;
+    dst->ref = 1;
+    dst->graph = src->graph;
+    dst->cursor = src->cursor;
+    FG_AddRef((IBaseFilter_DS*)dst->graph);
+    *pp = dst;
+    return S_OK;
+}
+static IEnumFiltersVtbl_DS g_EnumFiltersVtbl = {
+    EF_QI, EF_AddRef, EF_Release, EF_Next, EF_Skip, EF_Reset, EF_Clone
+};
+
+static HRESULT STDMETHODCALLTYPE FG_RemoveFilter(void *t, IBaseFilter_DS *f) {
+    FakeGraph *g = (FakeGraph*)t;
+    proxy_log("FakeGraph::RemoveFilter(%p)", f);
+    for (int i = 0; i < g->filter_count; i++) {
+        if (g->filters[i] == f) {
+            g->filters[i]->lpVtbl->Release(g->filters[i]);
+            for (int j = i; j < g->filter_count - 1; j++) {
+                g->filters[j] = g->filters[j+1];
+                wcscpy(g->filter_names[j], g->filter_names[j+1]);
+            }
+            g->filter_count--;
+            return S_OK;
+        }
+    }
+    return VFW_E_NOT_FOUND;
+}
+static HRESULT STDMETHODCALLTYPE FG_EnumFilters(void *t, void **pp) {
+    FakeGraph *g = (FakeGraph*)t;
+    proxy_log("FakeGraph::EnumFilters() count=%d", g->filter_count);
+    if (!pp) return E_POINTER;
+    EnumFilters *e = calloc(1, sizeof(*e));
+    if (!e) { *pp = NULL; return E_OUTOFMEMORY; }
+    e->lpVtbl = &g_EnumFiltersVtbl;
+    e->ref = 1;
+    e->graph = g;
+    e->cursor = 0;
+    FG_AddRef((IBaseFilter_DS*)g);
+    *pp = e;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE FG_FindFilterByName(void *t, LPCWSTR n, IBaseFilter_DS **pp) {
+    FakeGraph *g = (FakeGraph*)t;
+    proxy_log("FakeGraph::FindFilterByName(%ls)", n ? n : L"null");
+    if (!pp) return E_POINTER;
+    *pp = NULL;
+    if (!n) return E_POINTER;
+    for (int i = 0; i < g->filter_count; i++) {
+        if (wcscmp(g->filter_names[i], n) == 0) {
+            *pp = g->filters[i];
+            g->filters[i]->lpVtbl->AddRef(g->filters[i]);
+            return S_OK;
+        }
+    }
+    return VFW_E_NOT_FOUND;
+}
+static HRESULT STDMETHODCALLTYPE FG_ConnectDirect(void *t, IPin_DS *ppinOut, IPin_DS *ppinIn, const AM_MEDIA_TYPE *pmt) {
+    proxy_log("FakeGraph::ConnectDirect(out=%p, in=%p, mt=%p)", ppinOut, ppinIn, pmt);
+    if (!ppinOut || !ppinIn) return E_POINTER;
+    HRESULT hr = ppinOut->lpVtbl->Connect(ppinOut, ppinIn, pmt);
+    proxy_log("  -> hr=0x%08lX", hr);
+    return hr;
+}
 static HRESULT STDMETHODCALLTYPE FG_Reconnect(void *t, void *p) { proxy_log("FakeGraph::Reconnect()"); return S_OK; }
 static HRESULT STDMETHODCALLTYPE FG_Disconnect(void *t, void *p) { proxy_log("FakeGraph::Disconnect()"); return S_OK; }
 static HRESULT STDMETHODCALLTYPE FG_SetDefaultSyncSource(void *t) { proxy_log("FakeGraph::SetDefaultSyncSource()"); return S_OK; }
-static HRESULT STDMETHODCALLTYPE FG_Connect(void *t, void *a, void *b) { proxy_log("FakeGraph::Connect()"); return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE FG_Connect(void *t, IPin_DS *ppinOut, IPin_DS *ppinIn) {
+    proxy_log("FakeGraph::Connect(out=%p, in=%p)", ppinOut, ppinIn);
+    if (!ppinOut || !ppinIn) return E_POINTER;
+    HRESULT hr = ppinOut->lpVtbl->Connect(ppinOut, ppinIn, NULL);
+    proxy_log("  -> hr=0x%08lX", hr);
+    return hr;
+}
 static HRESULT STDMETHODCALLTYPE FG_RenderFile(void *t, LPCWSTR f, LPCWSTR r) { proxy_log("FakeGraph::RenderFile(%ls)", f?f:L"null"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE FG_AddSourceFilter(void *t, LPCWSTR f, LPCWSTR n, void **pp) { proxy_log("FakeGraph::AddSourceFilter()"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE FG_SetLogFile(void *t, DWORD_PTR h) { return S_OK; }
@@ -331,8 +529,23 @@ static HRESULT STDMETHODCALLTYPE MC_Pause(void *This) {
 static HRESULT STDMETHODCALLTYPE MC_Stop(void *This) {
     FakeGraph *g = GRAPH_FROM_MC(This);
     TRACE_MSG("FG::MC::Stop()");
-    /* Don't actually stop filters here — the game's callback calls Stop+Run every frame.
-       Real cleanup happens in FG_Release when the graph is destroyed. */
+    /* Playback path (TEXTURERENDERER + our DSSourceFilter) does Stop+Run
+       every frame as a presentation tick — don't propagate that to the
+       filters or DSSourceFilter would tear down its libmpv pump. We
+       detect playback by source_filter being set (only AddFilter for
+       CLSID_WMAsfReader sets it).
+
+       Export path has source_filter==NULL: there we MUST forward Stop to
+       the WMAsfWriter so it flushes any buffered samples and closes the
+       output file. Without this the .wmv stays 0 bytes. */
+    if (!g->source_filter) {
+        for (int i = 0; i < g->filter_count; i++) {
+            if (g->filters[i]) {
+                proxy_log("  Stop filter[%d]=%p", i, g->filters[i]);
+                g->filters[i]->lpVtbl->Stop(g->filters[i]);
+            }
+        }
+    }
     g->running = FALSE;
     return S_OK;
 }
@@ -361,45 +574,125 @@ static HRESULT STDMETHODCALLTYPE MC_GetState(void *This, long ms, long *pState) 
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE MC_RenderFile(void *t, BSTR f) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE MC_StubV(void *t, ...) { return E_NOTIMPL; }
+/* Per-slot stubs with EXACT signatures so __stdcall pops the right
+   amount. NEVER use a variadic stub here — STDMETHODCALLTYPE silently
+   becomes __cdecl on variadic, which corrupts the caller's stack. */
+static HRESULT STDMETHODCALLTYPE MC_AddSourceFilter(void *t, BSTR f, void **pp) {
+    proxy_log("FG::MC::AddSourceFilter()");
+    if (pp) *pp = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT STDMETHODCALLTYPE MC_get_FilterCollection(void *t, void **pp) {
+    proxy_log("FG::MC::get_FilterCollection()");
+    if (pp) *pp = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT STDMETHODCALLTYPE MC_get_RegFilterCollection(void *t, void **pp) {
+    proxy_log("FG::MC::get_RegFilterCollection()");
+    if (pp) *pp = NULL;
+    return E_NOTIMPL;
+}
+static HRESULT STDMETHODCALLTYPE MC_StopWhenReady(void *t) {
+    proxy_log("FG::MC::StopWhenReady()");
+    return S_OK;
+}
 
 static IMediaControlVtbl_DS g_FGMediaControlVtbl = {
     MC_QI, MC_AddRef, MC_Release,
     Disp_GetTypeInfoCount, Disp_GetTypeInfo, Disp_GetIDsOfNames, Disp_Invoke,
     MC_Run, MC_Pause, MC_Stop, MC_GetState,
-    MC_RenderFile, (void*)MC_StubV, (void*)MC_StubV, (void*)MC_StubV, (void*)MC_StubV
+    MC_RenderFile,
+    (void*)MC_AddSourceFilter,
+    (void*)MC_get_FilterCollection,
+    (void*)MC_get_RegFilterCollection,
+    (void*)MC_StopWhenReady
 };
 
 /* ========== IMediaEvent ========== */
 
-static HRESULT STDMETHODCALLTYPE ME_QI(void *t, REFIID r, void **p) { return FG_QI((IBaseFilter_DS*)GRAPH_FROM_ME(t),r,p); }
-static ULONG STDMETHODCALLTYPE ME_AddRef(void *t) { return InterlockedIncrement(&GRAPH_FROM_ME(t)->ref_count); }
-static ULONG STDMETHODCALLTYPE ME_Release(void *t) { return FG_Release((IBaseFilter_DS*)GRAPH_FROM_ME(t)); }
+static HRESULT STDMETHODCALLTYPE ME_QI(void *t, REFIID r, void **p) {
+    proxy_log("FG::ME::QI({%08lX-%04X})", r->Data1, r->Data2);
+    return FG_QI((IBaseFilter_DS*)GRAPH_FROM_ME(t),r,p);
+}
+static ULONG STDMETHODCALLTYPE ME_AddRef(void *t) {
+    LONG r = InterlockedIncrement(&GRAPH_FROM_ME(t)->ref_count);
+    proxy_log("FG::ME::AddRef() -> %ld", r);
+    return r;
+}
+static ULONG STDMETHODCALLTYPE ME_Release(void *t) {
+    proxy_log("FG::ME::Release()");
+    return FG_Release((IBaseFilter_DS*)GRAPH_FROM_ME(t));
+}
 
 static HRESULT STDMETHODCALLTYPE ME_GetEventHandle(void *This, LONG_PTR *hEvent) {
     FakeGraph *g = GRAPH_FROM_ME(This);
-    TRACE_MSG("FG::ME::GetEventHandle()");
+    proxy_log("FG::ME::GetEventHandle()");
     if (!hEvent) return E_POINTER;
     *hEvent = (LONG_PTR)g->complete_event;
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE ME_GetEvent(void *t, long *code, LONG_PTR *p1, LONG_PTR *p2, long ms) {
-    TRACE_MSG("FG::ME::GetEvent(ms=%ld)", ms);
+    proxy_log("FG::ME::GetEvent(ms=%ld)", ms);
     return E_ABORT;
 }
 static HRESULT STDMETHODCALLTYPE ME_WaitForCompletion(void *t, long ms, long *pEvCode) {
-    TRACE_MSG("FG::ME::WaitForCompletion(ms=%ld)", ms);
+    proxy_log("FG::ME::WaitForCompletion(ms=%ld)", ms);
     if (pEvCode) *pEvCode = 0;
     return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE ME_Stub(void *t, ...) { return S_OK; }
+/* CRITICAL: each slot stub must have the EXACT real-method signature so
+   __stdcall callee-cleanup pops the right number of bytes. Variadic
+   stubs (`void *, ...`) silently downgrade to __cdecl in MSVC/MinGW
+   and break the caller's stack frame on every call — exactly the bug
+   that took ESI down on CancelDefaultHandling. */
+static HRESULT STDMETHODCALLTYPE ME_CancelDefaultHandling(void *t, long lEvCode) {
+    proxy_log("FG::ME::CancelDefaultHandling(%ld)", lEvCode);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE ME_RestoreDefaultHandling(void *t, long lEvCode) {
+    proxy_log("FG::ME::RestoreDefaultHandling(%ld)", lEvCode);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE ME_FreeEventParams(void *t, long lEvCode, LONG_PTR p1, LONG_PTR p2) {
+    proxy_log("FG::ME::FreeEventParams(%ld, %p, %p)", lEvCode, (void*)p1, (void*)p2);
+    return S_OK;
+}
+/* IMediaEventEx (slots 13-15) — system code may call these even with the
+   plain IMediaEvent IID; declare with correct signatures regardless. */
+static HRESULT STDMETHODCALLTYPE ME_SetNotifyWindow(void *t, LONG_PTR hwnd, long lMsg, LONG_PTR lData) {
+    proxy_log("FG::ME::SetNotifyWindow(hwnd=%p, msg=%ld)", (void*)hwnd, lMsg);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE ME_SetNotifyFlags(void *t, long flags) {
+    proxy_log("FG::ME::SetNotifyFlags(%ld)", flags);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE ME_GetNotifyFlags(void *t, long *flags) {
+    proxy_log("FG::ME::GetNotifyFlags()");
+    if (flags) *flags = 0;
+    return S_OK;
+}
+/* Slots 16-19 — past anything documented; if the system reaches them
+   we want to know. Single-pointer signature so __stdcall pops 4 + this. */
+static HRESULT STDMETHODCALLTYPE ME_StubExtra16(void *t, void *unused) { proxy_log("FG::ME::slot[16] (unknown)"); return S_OK; }
+static HRESULT STDMETHODCALLTYPE ME_StubExtra17(void *t, void *unused) { proxy_log("FG::ME::slot[17] (unknown)"); return S_OK; }
+static HRESULT STDMETHODCALLTYPE ME_StubExtra18(void *t, void *unused) { proxy_log("FG::ME::slot[18] (unknown)"); return S_OK; }
+static HRESULT STDMETHODCALLTYPE ME_StubExtra19(void *t, void *unused) { proxy_log("FG::ME::slot[19] (unknown)"); return S_OK; }
 
-static IMediaEventVtbl_DS g_FGMediaEventVtbl = {
-    ME_QI, ME_AddRef, ME_Release,
-    (void*)Disp_GetTypeInfoCount, (void*)Disp_GetTypeInfo, (void*)Disp_GetIDsOfNames, (void*)Disp_Invoke,
-    ME_GetEventHandle, ME_GetEvent, ME_WaitForCompletion,
-    (void*)ME_Stub, (void*)ME_Stub, (void*)ME_Stub
+/* The vtable struct only declares 13 slots; we extend it with extra
+   trailing entries via a flat void* array. The game will index by
+   offset, so as long as the addresses are in order the type system
+   doesn't matter. */
+static void *g_FGMediaEventVtblExt[20] = {
+    (void*)ME_QI, (void*)ME_AddRef, (void*)ME_Release,
+    (void*)Disp_GetTypeInfoCount, (void*)Disp_GetTypeInfo,
+    (void*)Disp_GetIDsOfNames, (void*)Disp_Invoke,
+    (void*)ME_GetEventHandle, (void*)ME_GetEvent, (void*)ME_WaitForCompletion,
+    (void*)ME_CancelDefaultHandling, (void*)ME_RestoreDefaultHandling, (void*)ME_FreeEventParams,
+    (void*)ME_SetNotifyWindow, (void*)ME_SetNotifyFlags, (void*)ME_GetNotifyFlags,
+    (void*)ME_StubExtra16, (void*)ME_StubExtra17, (void*)ME_StubExtra18, (void*)ME_StubExtra19
 };
+#define g_FGMediaEventVtbl (*(IMediaEventVtbl_DS*)g_FGMediaEventVtblExt)
 
 /* ========== IMediaSeeking (delegates to source filter) ========== */
 
@@ -621,6 +914,7 @@ HRESULT ds_fakegraph_create(void **ppGraph) {
     g->lpMediaSeekingVtbl = &g_FGMediaSeekingVtbl;
     g->lpMediaPositionVtbl = (void*)&g_FGMediaPositionVtbl;
     g->lpBasicAudioVtbl = &g_FGBasicAudioVtbl;
+    g->lpMediaEventSinkVtbl = &g_FGMediaEventSinkVtbl;
     g->ref_count = 1;
     g->complete_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 
