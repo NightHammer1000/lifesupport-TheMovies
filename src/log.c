@@ -4,7 +4,9 @@ FILE *g_logfile = NULL;
 
 void log_init(void) {
     if (!g_logfile) {
-        g_logfile = fopen("movies_fix.log", "a");
+        /* Truncate on each ASI load — every game run starts a fresh log so
+           old runs don't pollute the diagnostic context. */
+        g_logfile = fopen("movies_fix.log", "w");
     }
 }
 
