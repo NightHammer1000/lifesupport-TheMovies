@@ -25,6 +25,14 @@ stderr.txt
 release/
 *.zip
 
+# Local research scratch (extracted game data, sample inputs, traces).
+# Do NOT commit — most of this is copyrighted game data.
+research/
+
+# Bundled tools (installer-extracted scratch). Tools themselves are
+# fetched via documentation; the install dir is local-only.
+lib/tools/
+
 # Editor / OS noise
 .vscode/
 .idea/

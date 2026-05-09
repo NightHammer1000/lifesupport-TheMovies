@@ -15,6 +15,12 @@ CC      := C:/msys64/mingw32/bin/gcc.exe
 LD      := C:/msys64/mingw32/bin/i686-w64-mingw32-gcc.exe
 OBJDUMP := C:/msys64/mingw32/bin/objdump.exe
 
+# cc1.exe (spawned by gcc) needs the toolchain's runtime DLLs (libgcc_s,
+# libisl, libmpc, etc.) on PATH. Without this, recent MSYS2 builds fail
+# with "libgcc_s_dw2-1.dll not found" when invoked from a shell whose
+# PATH doesn't include mingw32/bin.
+export PATH := C:/msys64/mingw32/bin:$(PATH)
+
 BUILDDIR := build
 SRCDIR   := src
 MHDIR    := lib/minhook

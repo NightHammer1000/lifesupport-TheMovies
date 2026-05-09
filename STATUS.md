@@ -199,10 +199,86 @@ to disk and re-read by an `AsyncReader` filter rather than fed live.
 
 **Profile naming.** Built by `FUN_00a2f770` from a quality enum:
 `Data\Video\WMVProfile_{Upload|Small|Medium|High|Best}{_NA?}.prx`. The
-`_NA` suffix is appended when object offset `0x820` is false. Quality is
-read via `FUN_00acd42c` (5 cases). Existing files at
-`<game>\Data\Video\WMVProfile_*.prx` are XML profile descriptors that
-must be parsed for the writer (#3).
+`_NA` suffix is appended when object offset `0x820` is false (so
+`_NA` = "no audio"). Quality is read via `FUN_00acd42c` (5 cases).
+
+**Profile contents** (extracted from the `.pak` archives via Reshoot;
+see *Data extraction* below). Standard Microsoft WMV-profile XML,
+**UTF-16 LE with BOM**. Two `<streamconfig>` elements per profile (one
+for `_NA` variants — video only). Resolutions / bitrates:
+
+| Quality | Resolution | FPS | Video kbps (WMV3) | Audio kbps (WMA2) | Audio Hz |
+| --- | --- | --- | --- | --- | --- |
+| Upload | 384×216 | 20 | 114 | 20 | 22050 |
+| Small | 256×144 | 20 | 300 | 48 | 44100 |
+| Medium | 384×216 | 20 | 300 | 96 | 44100 |
+| High | 512×288 | 20 | 300 | 96 | 44100 |
+| Best | 768×432 | 30 | 8192 | 192 | 44100 |
+| (_NA variants) | as above | as above | as above | — | — |
+| Audio (standalone) | — | — | — | 96 | 44100 |
+
+Codecs: video is **WMV3** (`bicompression="WMV3"`, subtype
+`{33564D57-0000-0010-8000-00AA00389B71}` = `MEDIASUBTYPE_WMV3`); audio
+is **WMA Standard** (`wFormatTag="353"` = `0x161`, subtype
+`{00000161-0000-0010-8000-00AA00389B71}` = `MEDIASUBTYPE_WMAUDIO2`).
+Profile version field is `589824` = `0x90000` = `WMT_VER_9_0`.
+
+Sample profile structure (`wmvprofile_upload.prx`, decoded):
+
+```xml
+<profile version="589824" storageformat="1" name="MoviesOnline">
+  <streamconfig majortype="{73647561-…}" streamnumber="1"
+                streamname="Audio Stream" bitrate="20008" …>
+    <wmmediatype subtype="{00000161-…}" …>
+      <waveformatex wFormatTag="353" nChannels="2"
+                    nSamplesPerSec="22050" nAvgBytesPerSec="2501"
+                    nBlockAlign="813" wBitsPerSample="16"
+                    codecdata="0044000017 00B50C0000"/>
+    </wmmediatype>
+  </streamconfig>
+  <streamconfig majortype="{73646976-…}" streamnumber="2"
+                streamname="Video Stream" bitrate="114000" …>
+    <videomediaprops maxkeyframespacing="30000000" quality="40"/>
+    <wmmediatype subtype="{33564D57-…}" …>
+      <videoinfoheader dwbitrate="114000" avgtimeperframe="500000">
+        <rcsource left="0" top="0" right="384" bottom="216"/>
+        <rctarget left="0" top="0" right="384" bottom="216"/>
+        <bitmapinfoheader biwidth="384" biheight="216"
+                          bibitcount="24" bicompression="WMV3" …/>
+      </videoinfoheader>
+    </wmmediatype>
+  </streamconfig>
+</profile>
+```
+
+The XML in this exact form is what `IWMProfileManager::LoadProfileByData`
+receives (the bytes the game reads from the `.prx` file in the PAK,
+passed through directly).
+
+**Implications for #3 and #2:**
+- Parser only needs to recognise: `bicompression`, `biwidth`, `biheight`,
+  `dwbitrate`, `avgtimeperframe`, `nSamplesPerSec`, `nChannels`,
+  `nAvgBytesPerSec`, `wFormatTag`. The rest is decoration.
+- All five preset videos use the **same codec pair** (WMV3 + WMA2).
+  Encoder side (#2) only needs FFmpeg's `wmv2`/`wmv3` + `wmav2`
+  encoders + ASF muxer. Lots of FFmpeg can be cut (#7).
+- The XML BOM + UTF-16 encoding means the parser must handle wide
+  strings — `wcsstr` + a tiny attribute-value extractor is enough,
+  no full XML library needed.
+
+### Data extraction (for project records)
+
+The `.prx` profiles ship inside `Data\pak\*.pak` archives, not as loose
+files on disk. Extracted using **Reshoot**, the community CLI tool from
+[themovies3d.com](https://www.themovies3d.com/en/downloads/category/22-tools-a-utilities):
+
+```bash
+"/c/Program Files (x86)/The Movies Editor/reshoot.exe" -g -l "WMVProfile*"   # list
+"/c/Program Files (x86)/The Movies Editor/reshoot.exe" -g -e "WMVProfile_*.prx"  # extract
+```
+
+Extracted samples for development reference are under
+`mod/research/profiles/` (gitignored — game data).
 
 **Identified CLSIDs / IIDs in the writer path:**
 | Symbol | GUID |
