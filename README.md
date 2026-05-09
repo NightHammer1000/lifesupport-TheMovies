@@ -38,18 +38,28 @@ and answers them with a self-contained FFmpeg + libmpv stack.
   libmpv's volume property.
 - **No `quartz.dll`**: the entire DirectShow filter graph is replaced
   in-process; the game never touches the system DirectShow.
-- **Movie export plumbing**: the in-game studio's WMF writer path is
-  intercepted (`CLSID_WMAsfWriter` → custom filter backed by libavformat
-  ASF muxer + libavcodec). A real `.wmv` file is produced. Image
-  fidelity is a work in progress (codec parameters are still being
-  tuned).
+- **Movie export**: the in-game studio's WMF writer path is intercepted
+  end-to-end. `CLSID_WMAsfWriter` is replaced by a custom in-process
+  filter (`src/asf_writer.c`) that implements `IBaseFilter`,
+  `IFileSinkFilter`, `IConfigAsfWriter`, and an input pin, backed by
+  **libavformat (ASF muxer)** + **libavcodec (WMV2)**. The game's
+  rendered frames go through a hand-rolled BGR→YUV420P converter
+  (BT.601 limited range, 2x2 chroma averaging) — `sws_scale` was
+  producing garbage in our setup so we bypassed it. Output is a clean
+  `.wmv` that VLC and other players read correctly. **No qasf.dll /
+  wmvcore.dll / qcap.dll dependency.**
 
 ## Known limitations / TODO
 
-- **In-game gameplay untested.** Only menu-level paths are confirmed.
-- **Movie export image quality.** File is written; encoder parameters
-  may still produce visible artifacts. Tuning ongoing.
-- **Widescreen** rendering. Original ask, not started.
+- **In-game gameplay untested.** Only menu-level paths are confirmed
+  ([#9](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/9)).
+- **Movie export improvements** ([#10](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/10),
+  [#11](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/11),
+  [#12](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/12)):
+  switch to MP4+H.264 for universal player compatibility, drive
+  encoder bitrate from the captured `IWMProfile`, add audio stream.
+- **Widescreen** rendering ([#6](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/6)).
+  Original ask, not started.
 
 ## Install
 

@@ -12,24 +12,47 @@ frontend intro, frontend background loop — with clean audio/video sync
 (libmpv-paced). The game progresses past intros naturally; the menu
 file is the only one that loops.
 
-**Movie export** writes a real `.wmv` (libavformat ASF muxer +
-libavcodec WMV2). Codec parameter tuning is ongoing — current output
-has visible artifacts but the data path is end-to-end functional. The
-writer is `src/asf_writer.c`, intercepted at `CLSID_WMAsfWriter`.
+**Movie export works end-to-end.** `CLSID_WMAsfWriter` is intercepted
+in `main.c` and answered by `MoviesAsfWriter` (`src/asf_writer.c`) —
+an in-process IBaseFilter + IFileSinkFilter + IConfigAsfWriter + input
+pin, backed by libavformat (ASF muxer) and libavcodec (WMV2). Output
+is a clean `.wmv` that VLC reads. No qasf.dll / wmvcore.dll / qcap.dll
+dependency at runtime.
+
+Two notable forks during development, both reflected in commit history:
+
+- **`sws_scale` bypass.** sws produced structured garbage in U/V planes
+  (binary 0/255 in periodic 4-row stripes) regardless of source
+  pixel format, sws flags, or pixel format choice (BGRA vs BGR0 vs
+  BGR24). Isolated by dumping the raw BGRA input (clean) and the
+  post-sws YUV (broken). Replaced with a hand-rolled BGR→YUV420P
+  converter (BT.601 limited range, 2x2 chroma averaging, ~30 LOC).
+- **Drop-in replacement chosen over per-IID stubbing.** Initial
+  attempts passed-through to system qasf.dll's WMAsfWriter and tried
+  to satisfy each IID it asked us for (IObjectWithSite, IAMGraphStreams,
+  IWMMediaProps, IWMStreamConfig2, …). Worked far enough to confirm
+  the game wires up CGB2 + Profile correctly, but the system writer
+  itself was opaque and produced 0-byte files. Replacing the writer
+  wholesale (same approach as DSSourceFilter for playback) was much
+  more tractable — the in-process writer is ~1 KLOC and we own all
+  of it.
 
 **In-game play has not been exercised yet** (starting a studio,
 running the simulation, the campaign). Whether additional WMF /
-DirectShow paths fire during gameplay is unknown.
+DirectShow paths fire during gameplay is unknown — tracked as #9.
 
 Open work:
-1. **In-game gameplay verification** — never run past the menu yet;
-   file new issues for whatever surfaces.
-2. **Movie export image quality** — codec params (bitrate, qmin/qmax,
-   sws flags, profile-driven settings) still need tuning to clear the
-   pink/cyan striping artifact seen in early frames.
+1. **In-game gameplay verification** (#9) — verified scope ends at the
+   main menu.
+2. Movie export enhancements:
+   - #10 — switch container/codec to MP4 + H.264 for universal
+     compatibility (we're not bound to WMV; the game doesn't play
+     exports back in-engine — it re-renders previews from scene data).
+   - #11 — drive encoder `bit_rate` from the captured IWMProfile.
+   - #12 — audio stream support (writer is currently video-only).
 3. Widescreen rendering — not started (#6).
-4. Trim FFmpeg dependency: `sync_reader.c` and `asf_writer.c` are the
-   only consumers; we could carve a smaller static FFmpeg (#7).
+4. Trim FFmpeg dependency (#7): `sync_reader.c` and `asf_writer.c` are
+   the only consumers; a smaller static FFmpeg is feasible.
 
 ## Architecture
 
