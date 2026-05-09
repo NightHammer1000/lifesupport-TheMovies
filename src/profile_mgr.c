@@ -37,7 +37,6 @@ typedef struct ProxyStreamConfig {
 } ProxyStreamConfig;
 
 static HRESULT STDMETHODCALLTYPE SC_QI(IWMStreamConfig *This, REFIID riid, void **ppv) {
-    TRACE_MSG("SC_QI");
     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IWMStreamConfig)) {
         *ppv = This; This->lpVtbl->AddRef(This); return S_OK;
     }
@@ -138,7 +137,6 @@ typedef struct ProxyProfile {
 } ProxyProfile;
 
 static HRESULT STDMETHODCALLTYPE PR_QI(IWMProfile *This, REFIID riid, void **ppv) {
-    TRACE_MSG("PR_QI");
     if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IWMProfile)) {
         *ppv = This; This->lpVtbl->AddRef(This); return S_OK;
     }
@@ -348,16 +346,19 @@ static long long xml_attr_int(const WCHAR *haystack, const WCHAR *attr) {
     return _atoi64(buf);
 }
 
-/* Locate the next `<tag` in haystack and return the substring
-   spanning from that '<' to the matching `</tag>` (or `/>`).
-   *next_out is set to one past the end of that block, suitable for
-   continuing the scan. Returns NULL if not found. */
-static const WCHAR *xml_find_block(const WCHAR *haystack, const WCHAR *tag,
-                                   const WCHAR **next_out)
+/* Locate the next `<tag` in haystack and return a freshly malloc'd
+   NUL-terminated copy of the span from `<tag` through `</tag>` (or
+   through `/>` for self-closing). The copy is bounded so nested
+   xml_attr_str / xml_find_block calls cannot leak into siblings.
+   *next_out is set to one past the closing tag in the original buffer.
+   Caller frees the returned buffer. Returns NULL if not found. */
+static WCHAR *xml_find_block(const WCHAR *haystack, const WCHAR *tag,
+                             const WCHAR **next_out)
 {
     if (!haystack) return NULL;
     WCHAR open[32], close[32];
-    if (wcslen(tag) >= 28) return NULL;
+    size_t tlen = wcslen(tag);
+    if (tlen >= 28) return NULL;
     wcscpy(open,  L"<");
     wcscat(open,  tag);
     wcscpy(close, L"</");
@@ -365,13 +366,31 @@ static const WCHAR *xml_find_block(const WCHAR *haystack, const WCHAR *tag,
     wcscat(close, L">");
     const WCHAR *start = wcsstr(haystack, open);
     if (!start) return NULL;
-    /* Skip ahead past the opening `<tag` to find the closing `</tag>` or
-       a self-closing `/>`. We don't need to *return* the closing point
-       precisely — we return the block from start onward and let the
-       caller carry on scanning. Move next_out past the start so a
-       repeated search proceeds. */
-    if (next_out) *next_out = start + wcslen(open);
-    return start;
+
+    /* Find end of the opening tag: the next '>' after `<tag`. If the
+       character before that '>' is '/', it's a self-closing element. */
+    const WCHAR *gt = wcschr(start + 1 + tlen, L'>');
+    if (!gt) return NULL;
+    const WCHAR *end;
+    if (gt > start && gt[-1] == L'/') {
+        /* <tag .../>  — block ends right after '>' */
+        end = gt + 1;
+    } else {
+        /* Find matching </tag>. Naive: first occurrence after '>'. The
+           profile XML doesn't nest a tag of the same name inside itself. */
+        const WCHAR *cend = wcsstr(gt + 1, close);
+        if (!cend) return NULL;
+        end = cend + wcslen(close);
+    }
+
+    size_t span = (size_t)(end - start);
+    WCHAR *copy = malloc((span + 1) * sizeof(WCHAR));
+    if (!copy) return NULL;
+    memcpy(copy, start, span * sizeof(WCHAR));
+    copy[span] = 0;
+
+    if (next_out) *next_out = end;
+    return copy;
 }
 
 /* Map an XML majortype GUID (in `{HHHHHHHH-HHHH-…}` form) to one of our
@@ -420,13 +439,14 @@ static ProxyStreamConfig *parse_streamconfig(const WCHAR *block) {
 
     /* <wmmediatype subtype="..."> */
     const WCHAR *next = NULL;
-    const WCHAR *mt = xml_find_block(block, L"wmmediatype", &next);
+    WCHAR *mt = xml_find_block(block, L"wmmediatype", &next);
     if (mt && xml_attr_str(mt, L"subtype", guid_buf, sizeof(guid_buf)))
         classify_subtype(guid_buf, &sc->sub_type);
+    free(mt);
 
     if (IsEqualGUID(&sc->stream_type, &WMMEDIATYPE_Audio)) {
         /* <waveformatex …> */
-        const WCHAR *wfx = xml_find_block(block, L"waveformatex", &next);
+        WCHAR *wfx = xml_find_block(block, L"waveformatex", &next);
         if (wfx) {
             sc->format_tag        = (WORD) xml_attr_int(wfx, L"wFormatTag");
             sc->channels          = (WORD) xml_attr_int(wfx, L"nChannels");
@@ -434,28 +454,28 @@ static ProxyStreamConfig *parse_streamconfig(const WCHAR *block) {
             sc->avg_bytes_per_sec = (DWORD)xml_attr_int(wfx, L"nAvgBytesPerSec");
             sc->block_align       = (WORD) xml_attr_int(wfx, L"nBlockAlign");
             sc->bits_per_sample   = (WORD) xml_attr_int(wfx, L"wBitsPerSample");
-            /* codec_data is hex-encoded; not strictly needed for FFmpeg's
-               wmav2 encoder, but we capture length so the writer can
-               forward it if the muxer wants it. Skip the hex parse for
-               now — we'll add it iff #2 needs it. */
+            free(wfx);
         }
     } else if (IsEqualGUID(&sc->stream_type, &WMMEDIATYPE_Video)) {
         /* <videomediaprops quality=…> */
-        const WCHAR *vmp = xml_find_block(block, L"videomediaprops", &next);
+        WCHAR *vmp = xml_find_block(block, L"videomediaprops", &next);
         if (vmp) sc->video_quality = (DWORD)xml_attr_int(vmp, L"quality");
+        free(vmp);
 
         /* <videoinfoheader avgtimeperframe=…> */
-        const WCHAR *vih = xml_find_block(block, L"videoinfoheader", &next);
+        WCHAR *vih = xml_find_block(block, L"videoinfoheader", &next);
         if (vih) sc->avg_time_per_frame = xml_attr_int(vih, L"avgtimeperframe");
+        free(vih);
 
         /* <bitmapinfoheader biwidth=… biheight=… bicompression=…> */
-        const WCHAR *bih = xml_find_block(block, L"bitmapinfoheader", &next);
+        WCHAR *bih = xml_find_block(block, L"bitmapinfoheader", &next);
         if (bih) {
             sc->width  = (int)xml_attr_int(bih, L"biwidth");
             sc->height = (int)xml_attr_int(bih, L"biheight");
             xml_attr_str(bih, L"bicompression",
                          sc->compression, sizeof(sc->compression));
         }
+        free(bih);
     }
     return sc;
 }
@@ -472,9 +492,10 @@ static int parse_prx_profile(const WCHAR *xml_data, ProxyProfile *p) {
     const WCHAR *cursor = xml_data;
     while (count < MAX_PROFILE_STREAMS) {
         const WCHAR *next = NULL;
-        const WCHAR *block = xml_find_block(cursor, L"streamconfig", &next);
+        WCHAR *block = xml_find_block(cursor, L"streamconfig", &next);
         if (!block) break;
         ProxyStreamConfig *sc = parse_streamconfig(block);
+        free(block);
         if (sc) {
             p->streams[p->stream_count++] = sc;
             count++;
