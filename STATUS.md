@@ -423,6 +423,35 @@ once-only flag is replaced by a counter capped at 5.
 
 See `src/main.c::vectored_handler`.
 
+### 6. Pin outliving filter → cascade-Release UAF
+
+Filter destruction (`BF_Release` at refcount 0) released its
+create-ref on each pin and then `free()`d the filter struct. If a
+downstream consumer (TEXTURERENDERER, the FakeGraph's filter list)
+still held a pin reference, the pin survived. Later, when that last
+ref was finally Released, the pin's cascade-free called
+`pin->peer->Release(pin->peer)` on what was by then a freed
+TEXTURERENDERER input pin — UAF, with the call landing through a
+recycled vtable slot.
+
+Symptom in the log: clean teardown (`FakeGraph destroyed` →
+`DSFilter destroyed`), then **5 s of silence**, then a stray
+`Pin_Release`, then an access violation inside USER32 writing to
+`0x0000000C` (vtable slot `Release` through a partly-zeroed freed
+allocation). Crash vanishes under a Windows debugger because the
+debug heap pattern-fills freed memory and spaces allocations apart,
+so the cascade-Release lands somewhere benign — classic heisenbug.
+
+**Fix:** in `BF_Release`, eagerly call `Pin_Disconnect` on each pin
+*before* releasing it (so peer / peer_mem / allocator are released
+while their objects are still presumably alive, instead of seconds
+later from a stale ref), and clear `pin->filter` to NULL so any
+post-free `Pin_QueryPinInfo` doesn't deref a freed filter.
+`Pin_QueryPinInfo` returns `E_UNEXPECTED` when filter is NULL.
+
+See `src/ds_filter.c::BF_Release` and
+`src/ds_output_pin.c::Pin_QueryPinInfo`.
+
 ## libmpv quirks worth remembering
 
 - The render API requires `vo=libmpv` set *before* `mpv_initialize`.

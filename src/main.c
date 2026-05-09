@@ -300,6 +300,28 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
                       i*4, stack[i], stack[i+1], stack[i+2], stack[i+3]);
         }
 
+        /* Resolve every stack word that points into a loaded module — gives
+           us a poor-man's stack trace without needing StackWalk64. The crash
+           cause is almost always one of the return addresses on the stack
+           when EIP itself is inside a system DLL (USER32 et al). */
+        proxy_log("  Stack-word module resolution (first 64 DWORDs):");
+        for (int i = 0; i < 64; i++) {
+            if (IsBadReadPtr(&stack[i], 4)) break;
+            DWORD v = stack[i];
+            if (v < 0x10000 || v >= 0x80000000) continue;  /* skip non-code-looking values */
+            HMODULE m = NULL;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)(ULONG_PTR)v, &m) && m) {
+                char modname[MAX_PATH] = {0};
+                GetModuleFileNameA(m, modname, sizeof(modname));
+                const char *base = strrchr(modname, '\\');
+                base = base ? base + 1 : modname;
+                proxy_log("    ESP+%03X: %08lX  %s+0x%lX",
+                          i*4, v, base, v - (DWORD)(ULONG_PTR)m);
+            }
+        }
+
         /* Try to dump the object at EDI (likely the COM object being called) */
         DWORD *edi_obj = (DWORD *)(ULONG_PTR)c->Edi;
         if (edi_obj && !IsBadReadPtr(edi_obj, 32)) {

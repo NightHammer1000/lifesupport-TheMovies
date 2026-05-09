@@ -319,6 +319,12 @@ static HRESULT STDMETHODCALLTYPE Pin_QueryPinInfo(IPin_DS *This, PIN_INFO *pInfo
     TRACE_MSG("Pin_QueryPinInfo");
     DSOutputPin *pin = (DSOutputPin*)This;
     if (!pInfo) return E_POINTER;
+    if (!pin->filter) {
+        /* Filter has been destroyed but this pin is still alive (some
+           consumer's stale ref). Don't deref a freed filter. */
+        memset(pInfo, 0, sizeof(*pInfo));
+        return E_UNEXPECTED;
+    }
     pInfo->pFilter = (IBaseFilter_DS*)pin->filter;
     ((IBaseFilter_DS*)pin->filter)->lpVtbl->AddRef((IBaseFilter_DS*)pin->filter);
     pInfo->dir = PINDIR_OUTPUT;

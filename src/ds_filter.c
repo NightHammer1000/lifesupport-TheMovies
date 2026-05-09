@@ -229,8 +229,19 @@ static ULONG STDMETHODCALLTYPE BF_Release(IBaseFilter_DS *This) {
     if (ref == 0) {
         proxy_log("DSFilter destroyed");
         if (f->player) { mpv_player_destroy(f->player); f->player = NULL; }
-        for (int i = 0; i < f->pin_count; i++)
-            if (f->pins[i]) f->pins[i]->lpVtbl->Release((IPin_DS*)f->pins[i]);
+        for (int i = 0; i < f->pin_count; i++) {
+            if (!f->pins[i]) continue;
+            /* Eagerly disconnect: releases peer/peer_mem/allocator while
+               those refs are presumably still valid. Deferring this until
+               Pin_Release runs (potentially seconds later, after the
+               renderer has been freed) would deref a freed vtable. */
+            f->pins[i]->lpVtbl->Disconnect((IPin_DS*)f->pins[i]);
+            /* Clear the back-pointer so any post-free use of this pin
+               (e.g. Pin_QueryPinInfo from a stale ref) doesn't deref a
+               freed filter. */
+            f->pins[i]->filter = NULL;
+            f->pins[i]->lpVtbl->Release((IPin_DS*)f->pins[i]);
+        }
         if (f->first_frame_event) CloseHandle(f->first_frame_event);
         DeleteCriticalSection(&f->cs);
         free(f->bgr24_buf);
