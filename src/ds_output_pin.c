@@ -392,8 +392,14 @@ HRESULT ds_output_pin_deliver(DSOutputPin *pin, BYTE *data, long size,
     if (pin->flushing) return S_FALSE;
 
     IMediaSample_DS *sample = NULL;
-    HRESULT hr = pin->allocator->lpVtbl->GetBuffer(pin->allocator, &sample, NULL, NULL, 0);
-    if (hr < 0 || !sample) return hr;
+    /* AM_GBF_NOWAIT (0x4): if all 4 buffers are in flight (renderer stalled,
+       mode-switching, ESC-skip mid-frame), drop this frame instead of
+       blocking forever. A blocked GetBuffer on the mpv render thread means
+       it never sees stop_event during teardown — orphaning the thread past
+       the 5 s wait in mpv_player_destroy and racing against the renderer's
+       own D3D9 cleanup. Lost frames are far cheaper than a hung teardown. */
+    HRESULT hr = pin->allocator->lpVtbl->GetBuffer(pin->allocator, &sample, NULL, NULL, 0x4);
+    if (hr < 0 || !sample) return S_FALSE;
 
     BYTE *buf = NULL;
     sample->lpVtbl->GetPointer(sample, &buf);

@@ -227,21 +227,37 @@ static ULONG STDMETHODCALLTYPE BF_Release(IBaseFilter_DS *This) {
     DSSourceFilter *f = (DSSourceFilter*)This;
     LONG ref = InterlockedDecrement(&f->ref_count);
     if (ref == 0) {
-        proxy_log("DSFilter destroyed");
+        proxy_log("DSFilter destroyed (pin_count=%d)", f->pin_count);
+
+        /* 1. Clear the mpv frame callback FIRST so the render thread can no
+           longer call into our pin/filter. This narrows the race window —
+           any cb already in flight will complete (we wait for the thread
+           below) but no new ones will fire. */
+        if (f->player) mpv_player_set_frame_callback(f->player, NULL, NULL);
+
+        /* 2. Stop the mpv render thread. Combined with NOWAIT GetBuffer in
+           the deliver path, the thread should now exit promptly even if
+           the renderer was stalled. */
         if (f->player) { mpv_player_destroy(f->player); f->player = NULL; }
+
+        /* 3. Disconnect pins NOW — TEXTURERENDERER (peer) is presumably
+           still alive. Releasing peer/peer_mem/allocator here lets the
+           renderer drop its D3D9 textures before the game's next
+           IDirect3DDevice9::Reset (which would otherwise fail because
+           outstanding references kept the device's resources pinned). */
         for (int i = 0; i < f->pin_count; i++) {
             if (!f->pins[i]) continue;
-            /* Eagerly disconnect: releases peer/peer_mem/allocator while
-               those refs are presumably still valid. Deferring this until
-               Pin_Release runs (potentially seconds later, after the
-               renderer has been freed) would deref a freed vtable. */
             f->pins[i]->lpVtbl->Disconnect((IPin_DS*)f->pins[i]);
-            /* Clear the back-pointer so any post-free use of this pin
-               (e.g. Pin_QueryPinInfo from a stale ref) doesn't deref a
-               freed filter. */
+            /* Clear the back-pointer so post-destroy Pin_QueryPinInfo
+               (from a surviving stale ref) doesn't deref a freed filter. */
             f->pins[i]->filter = NULL;
-            f->pins[i]->lpVtbl->Release((IPin_DS*)f->pins[i]);
         }
+
+        /* 4. Drop our create-ref on each pin. */
+        for (int i = 0; i < f->pin_count; i++) {
+            if (f->pins[i]) f->pins[i]->lpVtbl->Release((IPin_DS*)f->pins[i]);
+        }
+
         if (f->first_frame_event) CloseHandle(f->first_frame_event);
         DeleteCriticalSection(&f->cs);
         free(f->bgr24_buf);

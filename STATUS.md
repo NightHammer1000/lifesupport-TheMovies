@@ -423,34 +423,75 @@ once-only flag is replaced by a counter capped at 5.
 
 See `src/main.c::vectored_handler`.
 
-### 6. Pin outliving filter → cascade-Release UAF
+### 6. Render thread blocked in GetBuffer → orphaned past `mpv_player_destroy`'s 5 s wait → corrupted D3D9 teardown
 
-Filter destruction (`BF_Release` at refcount 0) released its
-create-ref on each pin and then `free()`d the filter struct. If a
-downstream consumer (TEXTURERENDERER, the FakeGraph's filter list)
-still held a pin reference, the pin survived. Later, when that last
-ref was finally Released, the pin's cascade-free called
-`pin->peer->Release(pin->peer)` on what was by then a freed
-TEXTURERENDERER input pin — UAF, with the call landing through a
-recycled vtable slot.
+**Symptom.** Game launches and menu FMVs play fine. When the user
+clicks past the menu to enter the studio, the game crashes with an
+access violation inside `USER32.dll` writing to `0x0000000C`. The
+USER32 frame is at the bottom of a five-frame call chain entirely
+inside `d3d9.dll` — the game has called into d3d9 (likely
+`IDirect3DDevice9::Reset` for the in-game mode switch) and d3d9 has
+crashed in its own internal teardown. **Vanishes under a Windows
+debugger**: focus / scheduling / heap behaviour shift just enough
+that the renderer's stall doesn't recur.
 
-Symptom in the log: clean teardown (`FakeGraph destroyed` →
-`DSFilter destroyed`), then **5 s of silence**, then a stray
-`Pin_Release`, then an access violation inside USER32 writing to
-`0x0000000C` (vtable slot `Release` through a partly-zeroed freed
-allocation). Crash vanishes under a Windows debugger because the
-debug heap pattern-fills freed memory and spaces allocations apart,
-so the cascade-Release lands somewhere benign — classic heisenbug.
+The pre-crash log shows clean teardown (`FakeGraph destroyed` →
+`DSFilter destroyed`), then **exactly 5 s of silence**, then a stray
+`Pin_Disconnect` + `Pin_Release` from outside our code, then the AV.
 
-**Fix:** in `BF_Release`, eagerly call `Pin_Disconnect` on each pin
-*before* releasing it (so peer / peer_mem / allocator are released
-while their objects are still presumably alive, instead of seconds
-later from a stale ref), and clear `pin->filter` to NULL so any
-post-free `Pin_QueryPinInfo` doesn't deref a freed filter.
-`Pin_QueryPinInfo` returns `E_UNEXPECTED` when filter is NULL.
+**Cause.** That 5 s gap is `mpv_player_destroy`'s
+`WaitForSingleObject(p->render_thread, 5000)` timing out. The mpv
+render thread was blocked inside `IMemAllocator::GetBuffer` —
+`GetBuffer` defaults to *infinite* wait when all buffers are in
+flight, and once the renderer stops consuming (mode change,
+ESC-skip, transition between menus) all 4 buffers stay pinned. The
+thread never sees `stop_event` so the wait times out, after which
+`mpv_player_destroy` proceeds anyway, leaving the thread orphaned.
 
-See `src/ds_filter.c::BF_Release` and
-`src/ds_output_pin.c::Pin_QueryPinInfo`.
+The orphan thread eventually unblocks and may still call
+`pin->peer_mem->Receive(...)` against TEXTURERENDERER. Even if it
+doesn't crash directly, it pins TEXTURERENDERER's allocator/sample
+chain (and therefore its D3D9 textures) past the point where the
+game expects the renderer's resources to be free. The next
+`IDirect3DDevice9::Reset` finds resources still held and goes off
+the rails inside d3d9 internals.
+
+This was *also* the source of the secondary symptom "menu video
+stops when navigating into the Render Movie menu and back" — the
+previous filter's mpv stayed half-alive, holding TEXTURERENDERER
+state, and the next filter's playback couldn't push frames through.
+
+**Fix (attempt — unverified).** Three coordinated changes:
+
+1. `ds_output_pin_deliver` passes `AM_GBF_NOWAIT` (`0x4`) to
+   `GetBuffer`. The render thread now drops the frame instead of
+   blocking when buffers are in flight. Any subsequent
+   `mpv_player_destroy` finds the thread free to observe
+   `stop_event` and exit promptly.
+
+2. `BF_Release` clears the mpv frame callback **before** calling
+   `mpv_player_destroy`, so any in-flight render-thread iteration
+   completes without entering `on_mpv_frame` again, and no new
+   iterations call our deliver path.
+
+3. `BF_Release` calls `Pin_Disconnect` *after* `mpv_player_destroy`
+   returns — at that point the render thread is gone, so
+   peer / peer_mem / allocator can be released without racing the
+   render thread, and the renderer can drop its D3D9 textures
+   before the game's next `Reset`.
+
+`pin->filter` is also cleared on destroy and `Pin_QueryPinInfo`
+returns `E_UNEXPECTED` when filter is NULL, in case a stale pin ref
+survives our destruction.
+
+If the d3d9 crash recurs after this, fall back to **Plan B**: hook
+`IDirect3DDevice9::Reset` (vtable slot 16, intercepted by hooking
+`IDirect3D9::CreateDevice` → patch returned device's vtable) and
+force-tear-down all live filters before forwarding to the real
+Reset.
+
+See `src/ds_filter.c::BF_Release`, `src/ds_output_pin.c::Pin_QueryPinInfo`,
+`src/ds_output_pin.c::ds_output_pin_deliver`.
 
 ## libmpv quirks worth remembering
 
