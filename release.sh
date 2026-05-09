@@ -63,8 +63,17 @@ existing one and only copy movies_fix.asi + libmpv-2.dll.
 
 Logs go to movies_fix.log in the game directory.
 
-See README.md for what this mod does and which version of the game it
-targets.
+VERIFIED SCOPE
+--------------
+This release has been verified to work for launch + main menu navigation.
+Actual in-game play (starting a studio, the campaign, the simulation)
+has NOT been tested yet. Movie export writes a real .wmv but the encoded
+output may show codec artifacts — fix in progress.
+
+If you hit a problem during gameplay, please file an issue with your
+movies_fix.log attached.
+
+See README.md for the full feature matrix and architecture notes.
 
 This is part of the KPC Classics Conservation Program — see kpc.bz.
 EOF

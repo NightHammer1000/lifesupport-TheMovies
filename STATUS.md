@@ -6,17 +6,30 @@ non-obvious bugs we hit getting it stable.
 
 ## Status
 
-**Phase 1 done.** All FMV cutscenes play with clean audio/video sync
-(libmpv-paced). The Activision logo, frontend intro and menu loop all
-work. The game progresses past intros naturally; the menu file is the
-only one that loops.
+**Verified scope: launch through main menu only.** All FMV cutscenes
+that play around the launch and menu surface work — Activision logo,
+frontend intro, frontend background loop — with clean audio/video sync
+(libmpv-paced). The game progresses past intros naturally; the menu
+file is the only one that loops.
+
+**Movie export** writes a real `.wmv` (libavformat ASF muxer +
+libavcodec WMV2). Codec parameter tuning is ongoing — current output
+has visible artifacts but the data path is end-to-end functional. The
+writer is `src/asf_writer.c`, intercepted at `CLSID_WMAsfWriter`.
+
+**In-game play has not been exercised yet** (starting a studio,
+running the simulation, the campaign). Whether additional WMF /
+DirectShow paths fire during gameplay is unknown.
 
 Open work:
-1. Movie *export* — RE complete (#1, see *Writer call surface* below);
-   implementation tracked as #2.
-2. Widescreen rendering — not started (#6).
-3. Trim FFmpeg dependency: `sync_reader.c` is the only consumer; we
-   could carve a much smaller static FFmpeg (#7).
+1. **In-game gameplay verification** — never run past the menu yet;
+   file new issues for whatever surfaces.
+2. **Movie export image quality** — codec params (bitrate, qmin/qmax,
+   sws flags, profile-driven settings) still need tuning to clear the
+   pink/cyan striping artifact seen in early frames.
+3. Widescreen rendering — not started (#6).
+4. Trim FFmpeg dependency: `sync_reader.c` and `asf_writer.c` are the
+   only consumers; we could carve a smaller static FFmpeg (#7).
 
 ## Architecture
 

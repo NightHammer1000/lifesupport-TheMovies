@@ -17,11 +17,20 @@ WMF implementation, and the in-game movie studio plus all FMVs depend on
 it. This mod intercepts WMF / DirectShow at the entry points the game uses
 and answers them with a self-contained FFmpeg + libmpv stack.
 
-## What works (Phase 1)
+## Verified scope: launch screens through main menu only
 
-- **All FMV cutscenes**: Activision logo, frontend intro, frontend
-  background loop. Clean lip-sync (verified against the intro's "3-2-1
-  beep" countdown).
+> **Important.** Everything below has been verified up to and including
+> the main menu. **Actual in-game play (starting a studio, running the
+> simulation, the campaign) has not been tested yet.** The mod replaces
+> the WMF dependencies the game touches at launch and on the menu —
+> whether further DirectShow / WMF code paths fire during gameplay is
+> unknown. Tracked as an open issue.
+
+## What works (verified)
+
+- **All FMV cutscenes** that play before/around the menu: Activision logo,
+  frontend intro, frontend background loop. Clean lip-sync (verified
+  against the intro's "3-2-1 beep" countdown).
 - **Audio**: routed through libmpv → WASAPI. No drift, no underruns.
 - **Looping**: only files whose name contains `loop` (i.e. the menu
   background) loop. Intros end naturally and the game progresses.
@@ -29,11 +38,17 @@ and answers them with a self-contained FFmpeg + libmpv stack.
   libmpv's volume property.
 - **No `quartz.dll`**: the entire DirectShow filter graph is replaced
   in-process; the game never touches the system DirectShow.
+- **Movie export plumbing**: the in-game studio's WMF writer path is
+  intercepted (`CLSID_WMAsfWriter` → custom filter backed by libavformat
+  ASF muxer + libavcodec). A real `.wmv` file is produced. Image
+  fidelity is a work in progress (codec parameters are still being
+  tuned).
 
-## What's still TODO
+## Known limitations / TODO
 
-- **Movie export** (in-game studio's render path via `IWMWriter`). Currently
-  stubbed — the game can record but won't write a finished file out yet.
+- **In-game gameplay untested.** Only menu-level paths are confirmed.
+- **Movie export image quality.** File is written; encoder parameters
+  may still produce visible artifacts. Tuning ongoing.
 - **Widescreen** rendering. Original ask, not started.
 
 ## Install
