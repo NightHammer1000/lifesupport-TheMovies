@@ -12,10 +12,11 @@ work. The game progresses past intros naturally; the menu file is the
 only one that loops.
 
 Open work:
-1. Movie *export* (in-game studio's `IWMWriter` path) — not started.
-2. Widescreen rendering — not started.
+1. Movie *export* — RE complete (#1, see *Writer call surface* below);
+   implementation tracked as #2.
+2. Widescreen rendering — not started (#6).
 3. Trim FFmpeg dependency: `sync_reader.c` is the only consumer; we
-   could carve a much smaller static FFmpeg.
+   could carve a much smaller static FFmpeg (#7).
 
 ## Architecture
 
@@ -109,6 +110,136 @@ Ghidra base `0x00400000`.
 | 0x14 | 400-byte sub-object (`FUN_009ed710`) |
 | 0x18 | 1 |
 | 0x1C | playback state (3 = setup, 1 = playing) |
+
+### Writer (movie export) call surface
+
+**Headline finding:** the game does **not** call `WMCreateWriter`.
+`MoviesSE.exe`'s only delay-loaded `wmvcore.dll` exports are
+`WMCreateSyncReader` and `WMCreateProfileManager` — confirmed by
+`list_imports`. The exporter is built as a **stock DirectShow capture
+graph** with `CLSID_WMAsfWriter` (which internally uses WMF) for the
+WMV path and a stock `CLSID_AVIMux` for the AVI path.
+
+The export class (likely `CAviSyst` based on RTTI string
+`.?AVCAviSyst@MV@@`) lives in a 0x888-byte allocation. Constructed by
+`FUN_00a2cb40`, vtable at `0x00d76cd8`. Global instance pointer:
+`DAT_010bab18`. Format flag at object offset `0x83c` (1 = WMV, 0 = AVI),
+audio-on flag at `0x828`. Output filename at offset `0x8` is built via
+`%s%s%s.{wmv|avi}` based on whether the profile name (offset `0x418`)
+contains the substring "Windows Media Format". A temp WAV file path
+`<savepath>\TMP%04d.wav` is stored at offset `0x210` — audio is staged
+to disk and re-read by an `AsyncReader` filter rather than fed live.
+
+**Vtable** (concrete C++ class, not COM): 7 slots at `0x00d76cd8`.
+| Slot | Address | Purpose |
+| --- | --- | --- |
+| 0 | `0x00a2f9b0` | scalar deleting destructor |
+| 1 | `0x00a2ffa0` | **start export** — builds graph + Run |
+| 2 | `0x00a2e560` | (unverified — encoder helper?) |
+| 3 | `0x00a2e590` | (unverified) |
+| 4 | `0x00a2e5b0` | (unverified) |
+| 5 | `0x00a2cce0` | (unverified) |
+| 6 | `0x00a2ecd0` | (unverified) |
+
+**Object field layout (relevant offsets):**
+| Offset | Field |
+| --- | --- |
+| `0x000` | vtable |
+| `0x008` | output filename (WCHAR\*) |
+| `0x210` | temp WAV path (WCHAR\*) |
+| `0x418` | profile name (WCHAR\*) |
+| `0x820` | profile suffix flag (`_NA` if false, "" if true) |
+| `0x828` | audio-on flag (BOOL) |
+| `0x83c` | format flag (1 = WMV, 0 = AVI) |
+| `0x840` | codec config (AVI mode) |
+| `0x858` | `IGraphBuilder*` (CLSID_FilterGraph) |
+| `0x85c` | `ICaptureGraphBuilder2*` (CLSID_CaptureGraphBuilder2) |
+| `0x860` | `IMediaControl*` (graph QI) |
+| `0x864` | `IMediaEvent*` (graph QI) |
+| `0x868` | (video source filter slot — added to graph) |
+| `0x86c` | video compressor filter |
+| `0x874` | audio compressor filter |
+| `0x878` | audio source — `CLSID_AsyncReader` (the WAV file reader) |
+| `0x87c` | `CLSID_WaveParser` |
+| `0x880` | mux/writer — **WMV: `CLSID_WMAsfWriter`** / **AVI: AVI MUX (found via `FindInterface`)** |
+| `0x884` | `IFileSinkFilter*` (QI from writer, WMV mode only) |
+
+**Setup / start sequence (in `FUN_00a2ffa0`, vtable[1]):**
+
+1. **`FUN_00a2c110`** — base graph creation:
+   - `CoCreateInstance(CLSID_FilterGraph,           IID_IGraphBuilder,           &obj_858)`
+   - `CoCreateInstance(CLSID_CaptureGraphBuilder2,  IID_ICaptureGraphBuilder2,   &obj_85c)`
+   - `obj_85c->SetFiltergraph(obj_858)`
+   - `obj_858->QI(IID_IMediaControl, &obj_860)`
+   - `obj_858->QI(IID_IMediaEvent,   &obj_864)`
+2. **`FUN_00a2f9d0`** — codec / sink setup:
+   - **AVI:** call helper `FUN_00a2f8c0`, then
+     `obj_85c->FindInterface(MEDIATYPE_Stream, &outname, &obj_880, 0)`
+     to obtain the AVI mux.
+   - **WMV:** `CoCreateInstance(CLSID_WMAsfWriter, IID_IBaseFilter, &obj_880)`,
+     `obj_880->QI(IID_IFileSinkFilter, &obj_884)`,
+     `obj_884->SetFileName(<filename>, NULL)`.
+   - **Audio (both modes):**
+     `CoCreateInstance(CLSID_AsyncReader,  IID_IBaseFilter, &obj_878)` (TMP wav),
+     `CoCreateInstance(CLSID_WaveParser,   IID_IBaseFilter, &obj_87c)`.
+3. **`FUN_00a2fc30` (WMV) / `FUN_00a2f550` (AVI)** — graph build:
+   - `IGraphBuilder::AddFilter` × N for: video source, video compressor,
+     (if audio) async reader + wave parser + audio compressor, mux/writer.
+   - **WMV:** load `Data\Video\WMVProfile_<quality>{_NA}.prx`
+     (`FUN_00a2f770` builds the path, `FUN_00a2e980` loads the XML via
+     `WMCreateProfileManager` → `CreateEmptyProfile(WMT_VER_7_0)` →
+     `LoadProfileByData(xml, ...)`), then push profile into the writer
+     (likely via `IConfigAsfWriter` QI'd from `obj_880` — the QI call is
+     the unrecovered-args call at the top of `FUN_00a2fc30`).
+   - **`FUN_00a2e4b0` + `FUN_00a2e610`** — pin connection helpers
+     called repeatedly to wire `pin → pin` for each filter→filter link:
+     V-source→V-comp→Mux/Writer, then Reader→Parser→A-comp→Mux/Writer.
+4. **`obj_860->Run()`** (`IMediaControl::Run`, vtable slot 7) starts the
+   pipeline.
+
+**Profile naming.** Built by `FUN_00a2f770` from a quality enum:
+`Data\Video\WMVProfile_{Upload|Small|Medium|High|Best}{_NA?}.prx`. The
+`_NA` suffix is appended when object offset `0x820` is false. Quality is
+read via `FUN_00acd42c` (5 cases). Existing files at
+`<game>\Data\Video\WMVProfile_*.prx` are XML profile descriptors that
+must be parsed for the writer (#3).
+
+**Identified CLSIDs / IIDs in the writer path:**
+| Symbol | GUID |
+| --- | --- |
+| `CLSID_FilterGraph` | `E436EBB3-524F-11CE-9F53-0020AF0BA770` |
+| `CLSID_CaptureGraphBuilder2` | `BF87B6E1-8C27-11D0-B3F0-00AA003761C5` |
+| `CLSID_WMAsfWriter` | `7C23220E-55BB-11D3-8B16-00C04FB6BD3D` |
+| `CLSID_AsyncReader` | `E436EBB5-524F-11CE-9F53-0020AF0BA770` |
+| `CLSID_WaveParser` | `D51BD5A1-7548-11CF-A520-0080C77EF58A` |
+| `IID_IGraphBuilder` | `56A868A9-0AD4-11CE-B03A-0020AF0BA770` |
+| `IID_ICaptureGraphBuilder2` | `93E5A4E0-2D50-11D2-ABFA-00A0C9C6E38D` |
+| `IID_IBaseFilter` | `56A86895-0AD4-11CE-B03A-0020AF0BA770` |
+| `IID_IMediaControl` | `56A868B1-0AD4-11CE-B03A-0020AF0BA770` |
+| `IID_IMediaEvent` | `56A868B6-0AD4-11CE-B03A-0020AF0BA770` |
+| `IID_IFileSinkFilter` | `A2104830-7C70-11CF-8BCE-00AA00A3F1A6` |
+
+**Implications for the shim (#2):**
+- We already hook `CoCreateInstance(CLSID_FilterGraph)` → returns our
+  `FakeGraph`. That covers the playback path. **For the writer path the
+  game also creates `CLSID_CaptureGraphBuilder2` and `CLSID_WMAsfWriter`
+  — neither is currently intercepted.**
+- Either:
+  - **(a)** intercept all three new CLSIDs and reimplement
+    `ICaptureGraphBuilder2::SetFiltergraph/RenderStream/FindInterface`
+    plus an `IFileSinkFilter` + `IConfigAsfWriter`-bearing writer
+    filter that ultimately calls FFmpeg's ASF muxer; OR
+  - **(b)** **simpler**: detect "writer setup in progress" (e.g. in
+    `FakeGraph::AddFilter` when the added filter has CLSID
+    `CLSID_WMAsfWriter` or is the AVI mux), tear down the placeholder
+    graph, and replace the *whole* export with a direct FFmpeg encode
+    that reads the rendered video frames from the existing
+    TEXTURERENDERER source and the audio from the staged TMP WAV file.
+    The game only inspects state via `IMediaControl::Run` /
+    `IMediaEvent::GetEvent` and a duration polling loop — easy to fake.
+
+The (b) path is significantly less surface area and avoids
+re-implementing DirectShow's graph builder. Recommended for #2.
 
 ## Gotchas (with fixes)
 
