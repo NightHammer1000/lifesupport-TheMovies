@@ -524,6 +524,12 @@ static HRESULT STDMETHODCALLTYPE MC_Pause(void *This) {
     TRACE_MSG("FG::MC::Pause()");
     for (int i = 0; i < g->filter_count; i++)
         if (g->filters[i]) g->filters[i]->lpVtbl->Pause(g->filters[i]);
+    /* Clear running so a subsequent MC_Run actually fires. The game uses
+       Pause when navigating into a sub-menu (e.g. Movie Player) and Run
+       to resume on return; without resetting the flag here, MC_Run's
+       early-return guard would silently drop the resume call and the
+       loop video would stay paused. */
+    g->running = FALSE;
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE MC_Stop(void *This) {
@@ -550,26 +556,9 @@ static HRESULT STDMETHODCALLTYPE MC_Stop(void *This) {
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE MC_GetState(void *This, long ms, long *pState) {
-    FakeGraph *g = GRAPH_FROM_MC(This);
-    TRACE_MSG("FG::MC::GetState()");
-    /* Dump COM interface state for crash diagnosis */
-    proxy_log("  FakeGraph @ %p ref=%ld", g, g->ref_count);
-    proxy_log("  lpGraphBuilderVtbl=%p lpMediaControlVtbl=%p", g->lpGraphBuilderVtbl, g->lpMediaControlVtbl);
-    proxy_log("  lpMediaEventVtbl=%p lpMediaSeekingVtbl=%p", g->lpMediaEventVtbl, g->lpMediaSeekingVtbl);
-    proxy_log("  lpMediaPositionVtbl=%p lpBasicAudioVtbl=%p", g->lpMediaPositionVtbl, g->lpBasicAudioVtbl);
-    /* Dump vtable entries for IMediaSeeking */
-    if (g->lpMediaSeekingVtbl) {
-        IMediaSeekingVtbl_DS *ms_vtbl = g->lpMediaSeekingVtbl;
-        proxy_log("  IMediaSeeking vtbl: [0]=%p [3]=%p [8]=%p [10]=%p",
-                  ms_vtbl->QueryInterface, ms_vtbl->GetCapabilities,
-                  ms_vtbl->IsUsingTimeFormat, ms_vtbl->GetDuration);
-    }
-    /* Dump IMediaControl vtable entries */
-    if (g->lpMediaControlVtbl) {
-        IMediaControlVtbl_DS *mc_vtbl = g->lpMediaControlVtbl;
-        proxy_log("  IMediaControl vtbl: Run=%p Pause=%p Stop=%p GetState=%p",
-                  mc_vtbl->Run, mc_vtbl->Pause, mc_vtbl->Stop, mc_vtbl->GetState);
-    }
+    /* Polled at frame rate — no logging. The earlier vtable-dump on every
+       call was for crash diagnosis (gotcha #1, IMediaSeeking-as-IMediaPosition
+       slot mismatch), which is now resolved and documented in STATUS.md. */
     if (pState) *pState = 2;
     return S_OK;
 }
@@ -798,7 +787,7 @@ static HRESULT STDMETHODCALLTYPE FMP_QI(void *t, REFIID r, void **p) { return FG
 static ULONG STDMETHODCALLTYPE FMP_AddRef(void *t) { return InterlockedIncrement(&GRAPH_FROM_MP(t)->ref_count); }
 static ULONG STDMETHODCALLTYPE FMP_Release(void *t) { return FG_Release((IBaseFilter_DS*)GRAPH_FROM_MP(t)); }
 static HRESULT STDMETHODCALLTYPE FMP_get_Duration(void *This, double *p) {
-    TRACE_MSG("FMP_get_Duration");
+    /* Polled at frame rate — silent. */
     if (!p) return E_POINTER;
     FakeGraph *g = GRAPH_FROM_MP(This);
     LONGLONG d = 0;
@@ -811,7 +800,7 @@ static HRESULT STDMETHODCALLTYPE FMP_get_Duration(void *This, double *p) {
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE FMP_get_CurrentPosition(void *This, double *p) {
-    TRACE_MSG("FMP_get_CurrentPosition");
+    /* Polled at frame rate — silent. */
     if (!p) return E_POINTER;
     FakeGraph *g = GRAPH_FROM_MP(This);
     LONGLONG c = 0;

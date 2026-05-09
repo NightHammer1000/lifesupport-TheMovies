@@ -310,6 +310,11 @@ static HRESULT STDMETHODCALLTYPE BF_Pause(IBaseFilter_DS *This) {
     }
     if (f->player) mpv_player_set_pause(f->player, TRUE);
     f->state = State_Paused;
+    /* Clear running so the next BF_Run's `if (!f->running)` guard fires
+       and we actually call mpv_player_set_pause(FALSE) to resume. Without
+       this, the game's pause→resume cycle (e.g. opening + closing the
+       Movie Player menu) leaves mpv paused indefinitely. */
+    f->running = FALSE;
     LeaveCriticalSection(&f->cs);
     return S_OK;
 }
@@ -334,7 +339,7 @@ static HRESULT STDMETHODCALLTYPE BF_Run(IBaseFilter_DS *This, REFERENCE_TIME tSt
 }
 
 static HRESULT STDMETHODCALLTYPE BF_GetState(IBaseFilter_DS *This, DWORD ms, FILTER_STATE *pState) {
-    TRACE_MSG("BF_GetState");
+    /* Polled at frame rate — silent. */
     if (!pState) return E_POINTER;
     *pState = ((DSSourceFilter*)This)->state;
     return S_OK;
@@ -557,10 +562,9 @@ static HRESULT STDMETHODCALLTYPE MS_SetTimeFormat(IMediaSeeking_DS *This, const 
 }
 
 static HRESULT STDMETHODCALLTYPE MS_GetDuration(IMediaSeeking_DS *This, LONGLONG *p) {
-    proxy_log("DSFilter::MS_GetDuration()");
+    /* Polled at frame rate — silent. */
     if (!p) return E_POINTER;
     *p = FILTER_FROM_SEEKING(This)->duration_100ns;
-    proxy_log("  -> %lld", (long long)*p);
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE MS_GetStopPosition(IMediaSeeking_DS *This, LONGLONG *p) {
@@ -570,7 +574,7 @@ static HRESULT STDMETHODCALLTYPE MS_GetStopPosition(IMediaSeeking_DS *This, LONG
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE MS_GetCurrentPosition(IMediaSeeking_DS *This, LONGLONG *p) {
-    TRACE_MSG("MS_GetCurrentPosition");
+    /* Polled at frame rate — silent. */
     if (!p) return E_POINTER;
     DSSourceFilter *f = FILTER_FROM_SEEKING(This);
     if (f->player) {

@@ -22,6 +22,7 @@ struct mpv_player {
     size_t                stride_bytes;   /* width*4, aligned up to 64 */
     BYTE                 *bgr0_buf;
     double                duration_sec;   /* cached from load */
+    BOOL                  is_loop;        /* set in mpv_player_load — disables eof clamp */
 
     mpv_frame_cb_t        frame_cb;
     void                 *frame_cb_user;
@@ -272,6 +273,7 @@ HRESULT mpv_player_load(mpv_player_t *p, const char *path_utf8, BOOL loop,
     LeaveCriticalSection(&p->cs);
 
     p->duration_sec = (dur > 0.0) ? dur : 0.0;
+    p->is_loop = loop;
 
     if (out_w) *out_w = (int)w;
     if (out_h) *out_h = (int)h;
@@ -291,12 +293,18 @@ void mpv_player_set_frame_callback(mpv_player_t *p, mpv_frame_cb_t cb, void *use
 
 double mpv_player_get_position(mpv_player_t *p) {
     if (!p || !p->mpv) return 0.0;
-    /* When the file ends and keep-open holds the last frame, time-pos may
-       lag duration by a frame or two. Clamp to duration once mpv signals
-       eof-reached so the game's "is finished" check fires. */
-    int eof = 0;
-    mpv_get_property(p->mpv, "eof-reached", MPV_FORMAT_FLAG, &eof);
-    if (eof && p->duration_sec > 0.0) return p->duration_sec;
+    /* For non-loop files: when the file ends and keep-open holds the last
+       frame, time-pos may lag duration by a frame or two. Clamp to duration
+       once mpv signals eof-reached so the game's "is finished" check fires.
+       For LOOP files (loop-file=inf): never clamp. eof-reached can briefly
+       toggle true at the loop boundary, and if the game polls in that
+       window it sees position == duration → IsFinished → tears the graph
+       down instead of resuming. */
+    if (!p->is_loop) {
+        int eof = 0;
+        mpv_get_property(p->mpv, "eof-reached", MPV_FORMAT_FLAG, &eof);
+        if (eof && p->duration_sec > 0.0) return p->duration_sec;
+    }
     double pos = 0.0;
     mpv_get_property(p->mpv, "time-pos", MPV_FORMAT_DOUBLE, &pos);
     return pos;
