@@ -493,7 +493,7 @@ when those interfaces are still routing through the system DLLs.
 
 **Fix:** ship dgVoodoo2's *full* wrapper set together — `DDraw.dll`,
 `D3D8.dll`, `D3D9.dll`, `D3DImm.dll` — and use the **default**
-`dgVoodooCpl.ini` unmodified. Only safe customisation is the
+`dgVoodoo.conf` unmodified. Only safe customisation is the
 watermark.
 
 `release/stage/INSTALL.txt` and the user-facing README call this out

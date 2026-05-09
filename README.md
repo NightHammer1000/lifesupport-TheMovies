@@ -85,7 +85,7 @@ If you also use [dgVoodoo2](http://dege.freeweb.hu/) for graphics fixes:
 - Drop **all four** dgVoodoo2 wrapper DLLs together: `DDraw.dll`,
   `D3D8.dll`, `D3D9.dll`, `D3DImm.dll`. Wrapping `D3D9.dll` alone
   causes a crash inside dgVoodoo2 at the transition into in-game mode.
-- Keep `dgVoodooCpl.ini` at its shipped defaults. The only safe
+- Keep `dgVoodoo.conf` at its shipped defaults. The only safe
   customisation is the watermark.
 
 ## Build
