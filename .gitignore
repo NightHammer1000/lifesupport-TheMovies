@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+*.asi
+*.o
+*.obj
+*.exp
+*.lib
+*.dll.so
+
+# libmpv archive — user provides locally (96 MB DLL)
+lib/libmpv/libmpv-2.dll
+lib/libmpv/libmpv.dll.a
+lib/libmpv/include/
+
+# FFmpeg source — built externally at C:/tmp/ffbuild/install; source is not
+# vendored in the repo
+lib/ffmpeg-*/
+
+# Local logs / scratch
+*.log
+stdout.txt
+stderr.txt
+
+# Release packaging
+release/
+*.zip
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

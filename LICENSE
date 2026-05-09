@@ -1,0 +1,122 @@
+KPC LifeSupport License v1.0
+Copyright (c) 2026 KPC Classics Conservation Program contributors
+
+This software is part of the KPC LifeSupport mod series, which exists to
+keep abandoned and at-risk games runnable. The license below is written
+in plain language. The plain-language wording is binding.
+
+
+1. WHAT YOU CAN DO
+
+You may, free of charge:
+
+  (a) use the Software, in source or binary form, for any purpose;
+  (b) study, modify, and create derivative works of the Software;
+  (c) distribute the Software, modified or unmodified, in source or
+      binary form, to any number of recipients, free of charge;
+  (d) integrate the Software with other software, including software
+      under different licenses, provided those other licenses are
+      compatible with this one for the resulting combined work;
+  (e) port the Software to other platforms or other versions of the
+      target game.
+
+
+2. WHAT YOU MUST DO
+
+  (a) Keep the original copyright notice, this license text, and any
+      attribution to original contributors with every copy and every
+      derivative work, both source and binary.
+  (b) Make it clearly identifiable that a derivative work is a
+      derivative — do not pass off modifications as the original.
+  (c) State, in any user-visible documentation of a derivative work,
+      that the work is based on KPC LifeSupport.
+
+
+3. WHAT YOU MAY NOT DO
+
+  (a) You may NOT sell the Software on its own, in any form, for any
+      price. This explicitly includes:
+      - listing it for sale on any storefront;
+      - making access conditional on a one-time purchase;
+      - placing it behind a recurring payment, subscription, donation
+        wall, Patreon tier, "early access" program, paid Discord, or
+        any equivalent mechanism that gates the Software, its updates,
+        or its source on payment.
+  (b) You may NOT bundle the Software with paid services or paid
+      content in a way that effectively monetises access to the
+      Software, even if the Software is nominally "free."
+  (c) You may NOT misrepresent the origin of the Software or remove
+      attribution to original contributors.
+
+
+4. THE BUNDLED-WITH-THE-GAME EXCEPTION
+
+The single exception to clause 3(a) is this: the rights holder of the
+target game, or a distributor authorised in writing by the rights
+holder (for example a digital storefront such as GOG or Steam acting
+on the publisher's behalf), MAY distribute the Software for
+consideration **only** when it is bundled together with a legitimately
+licensed copy of the target game it patches, and **only** as a
+component of that combined product. Even in that case:
+
+  (a) the bundled copy must keep this LICENSE file and all attribution
+      intact;
+  (b) the Software MUST also remain available, in source and binary
+      form, free of charge, from its public release page (this is so
+      that the bundled-game distribution cannot become the only way to
+      get the patch);
+  (c) modifying the Software to remove its free public availability,
+      or to add an authentication / online check tying it to a
+      specific paid distribution, is not permitted under this
+      exception and remains a violation of clause 3(a).
+
+This exception exists so that, if an original publisher or storefront
+chooses to adopt KPC LifeSupport patches as part of an official re-
+release, they can do so without the legal friction of a strict
+non-commercial clause — while still preventing third parties from
+profiteering off the preservation work.
+
+
+5. THIRD-PARTY COMPONENTS
+
+The binary distributions of this Software may include or link against
+third-party components under their own licenses. These components are
+governed by their own terms, NOT by this license. Known components and
+their licenses include, without limitation:
+
+  - libmpv (https://mpv.io)              — LGPL-2.1-or-later
+  - FFmpeg (https://ffmpeg.org)          — LGPL-2.1-or-later or GPL-2.0-or-later
+                                            depending on build configuration
+  - MinHook (vendored)                   — BSD 2-Clause
+  - Ultimate ASI Loader (when bundled)   — MIT (© ThirteenAG)
+
+When you redistribute a binary that includes any of these components,
+you must also comply with their licenses (typically: keep their
+copyright notices, ship their license text, and respect their source-
+availability obligations where applicable).
+
+
+6. NO WARRANTY
+
+The Software is provided "AS IS", without warranty of any kind,
+express or implied, including but not limited to the warranties of
+merchantability, fitness for a particular purpose, and noninfringement.
+In no event shall the authors or copyright holders be liable for any
+claim, damages, or other liability, whether in an action of contract,
+tort, or otherwise, arising from, out of, or in connection with the
+Software or the use or other dealings in the Software.
+
+
+7. SPIRIT
+
+The intent of this license is simple:
+  - Anyone may use the work, build on it, and share it.
+  - Original credit must stay intact.
+  - Nobody may turn it into a paid product on its own — neither sold
+    outright nor gated behind a subscription, donation tier, or
+    paywall of any kind.
+  - The one exception is an authorised re-release where the patch is
+    one component of a legitimately licensed copy of the game.
+
+If a use case falls between the lines of clauses 1–6, refer to this
+clause 7. The plain intent governs.
