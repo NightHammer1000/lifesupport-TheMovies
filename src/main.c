@@ -105,6 +105,17 @@ static FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
 
 static BOOL g_in_video_setup = FALSE; /* TRUE between FilterGraph and WMAsfReader creation */
 
+/* Map a CLSID to a short human-readable name (best-effort) for the log. */
+static const char *clsid_name(REFCLSID rclsid) {
+    if (IsEqualGUID(rclsid, &CLSID_FilterGraph))           return "CLSID_FilterGraph";
+    if (IsEqualGUID(rclsid, &CLSID_WMAsfReader))           return "CLSID_WMAsfReader";
+    if (IsEqualGUID(rclsid, &CLSID_CaptureGraphBuilder2))  return "CLSID_CaptureGraphBuilder2";
+    if (IsEqualGUID(rclsid, &CLSID_WMAsfWriter))           return "CLSID_WMAsfWriter";
+    if (IsEqualGUID(rclsid, &CLSID_AsyncReader))           return "CLSID_AsyncReader";
+    if (IsEqualGUID(rclsid, &CLSID_WaveParser))            return "CLSID_WaveParser";
+    return NULL;
+}
+
 static HRESULT WINAPI Hook_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter,
     DWORD dwClsContext, REFIID riid, LPVOID *ppv)
 {
@@ -124,6 +135,24 @@ static HRESULT WINAPI Hook_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter
         hr = pFilter->lpVtbl->QueryInterface(pFilter, riid, ppv);
         pFilter->lpVtbl->Release(pFilter);
         g_in_video_setup = FALSE;
+        return hr;
+    }
+
+    /* Writer-path CLSIDs (movie export). Issue #2 — currently
+       logging-only: we let the request through to the system
+       implementation if it works, otherwise fail. The point of this
+       pass is to confirm the call sequence in the live log so the
+       full short-circuit can be designed. */
+    const char *known = clsid_name(rclsid);
+    if (known &&
+        (IsEqualGUID(rclsid, &CLSID_CaptureGraphBuilder2) ||
+         IsEqualGUID(rclsid, &CLSID_WMAsfWriter) ||
+         IsEqualGUID(rclsid, &CLSID_AsyncReader) ||
+         IsEqualGUID(rclsid, &CLSID_WaveParser))) {
+        proxy_log("CoCreateInstance(%s, riid={%08lX-%04X-%04X}) — passthrough (issue #2)",
+                  known, riid->Data1, riid->Data2, riid->Data3);
+        HRESULT hr = orig_CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
+        proxy_log("  -> hr=0x%08lX, ppv=%p", hr, ppv ? *ppv : NULL);
         return hr;
     }
 
