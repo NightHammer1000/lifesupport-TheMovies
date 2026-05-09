@@ -229,15 +229,27 @@ static ULONG STDMETHODCALLTYPE BF_Release(IBaseFilter_DS *This) {
     if (ref == 0) {
         proxy_log("DSFilter destroyed (pin_count=%d)", f->pin_count);
 
-        /* 1. Clear the mpv frame callback FIRST so the render thread can no
-           longer call into our pin/filter. This narrows the race window —
-           any cb already in flight will complete (we wait for the thread
-           below) but no new ones will fire. */
+        /* 1. BeginFlush each connected peer so any in-flight Receive on
+           the renderer side returns immediately. Without this, the mpv
+           render thread can be stuck inside peer_mem->Receive — typical
+           when the menu-loop FMV is torn down mid-frame as the game is
+           switching D3D9 modes. The 5 s timeout in mpv_player_destroy
+           then fires and orphans the render thread, which is what
+           previously poisoned the renderer's D3D9 state. */
+        for (int i = 0; i < f->pin_count; i++) {
+            if (f->pins[i] && f->pins[i]->peer) {
+                proxy_log("  BeginFlush downstream pin[%d]", i);
+                f->pins[i]->peer->lpVtbl->BeginFlush(f->pins[i]->peer);
+            }
+        }
+
+        /* 2. Clear the mpv frame callback so the render thread won't enter
+           cb on its NEXT iteration (any in-flight cb completes via the
+           BeginFlush above). */
         if (f->player) mpv_player_set_frame_callback(f->player, NULL, NULL);
 
-        /* 2. Stop the mpv render thread. Combined with NOWAIT GetBuffer in
-           the deliver path, the thread should now exit promptly even if
-           the renderer was stalled. */
+        /* 3. Stop the mpv render thread. With BeginFlush above + NOWAIT in
+           GetBuffer, the thread now reliably observes stop_event. */
         if (f->player) { mpv_player_destroy(f->player); f->player = NULL; }
 
         /* 3. Disconnect pins NOW — TEXTURERENDERER (peer) is presumably

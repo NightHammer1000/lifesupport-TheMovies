@@ -27,6 +27,12 @@ struct mpv_player {
     void                 *frame_cb_user;
 
     CRITICAL_SECTION      cs;             /* guards size + buffer + frame_cb */
+
+    /* Set TRUE by mpv_player_destroy before signalling stop_event. While
+       TRUE the render thread logs each step it enters, so a 5 s
+       WaitForSingleObject timeout in destroy can be diagnosed: the last
+       breadcrumb in the log is the call the thread was blocked inside. */
+    volatile LONG         shutting_down;
 };
 
 /* ---------- update callback (called from mpv's render thread) ---------- */
@@ -75,26 +81,34 @@ static void drain_events(mpv_player_t *p) {
 }
 
 /* ---------- render thread ---------- */
+#define BC(p, msg) do { if ((p)->shutting_down) proxy_log("mpv rt: " msg); } while (0)
+
 static unsigned __stdcall render_thread_proc(void *arg) {
     mpv_player_t *p = (mpv_player_t*)arg;
     HANDLE waits[2] = { p->update_event, p->stop_event };
     proxy_log("mpv render thread started (tid=%lu)", GetCurrentThreadId());
 
     for (;;) {
+        BC(p, "loop top -> WFMO");
         DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        BC(p, "WFMO returned");
         if (r == WAIT_OBJECT_0 + 1) break;            /* stop */
         if (r != WAIT_OBJECT_0) continue;
 
+        BC(p, "drain_events");
         drain_events(p);
 
+        BC(p, "render_context_update");
         uint64_t flags = mpv_render_context_update(p->render);
-        if (!(flags & MPV_RENDER_UPDATE_FRAME)) continue;
+        if (!(flags & MPV_RENDER_UPDATE_FRAME)) { BC(p, "no frame, continue"); continue; }
 
         /* Pick up current width/height from mpv (may change at first frame). */
+        BC(p, "get width/height");
         int64_t mw = 0, mh = 0;
         mpv_get_property(p->mpv, "width",  MPV_FORMAT_INT64, &mw);
         mpv_get_property(p->mpv, "height", MPV_FORMAT_INT64, &mh);
 
+        BC(p, "EnterCS");
         EnterCriticalSection(&p->cs);
         if (mw > 0 && mh > 0) ensure_buffer_locked(p, (int)mw, (int)mh);
         int w = p->width, h = p->height;
@@ -103,6 +117,7 @@ static unsigned __stdcall render_thread_proc(void *arg) {
         mpv_frame_cb_t cb = p->frame_cb;
         void *cb_user = p->frame_cb_user;
         LeaveCriticalSection(&p->cs);
+        BC(p, "LeaveCS");
 
         if (!buf || w <= 0 || h <= 0) continue;
 
@@ -117,7 +132,9 @@ static unsigned __stdcall render_thread_proc(void *arg) {
             { MPV_RENDER_PARAM_SW_POINTER, buf },
             { 0, NULL }
         };
+        BC(p, "render_context_render");
         int rc = mpv_render_context_render(p->render, params);
+        BC(p, "render_context_render returned");
         if (rc < 0) {
             proxy_log("mpv: render_context_render failed: %d (%s)",
                       rc, mpv_error_string(rc));
@@ -125,11 +142,14 @@ static unsigned __stdcall render_thread_proc(void *arg) {
         }
 
         /* mpv-reported PTS in seconds → 100 ns. */
+        BC(p, "get time-pos");
         double pos_sec = 0.0;
         mpv_get_property(p->mpv, "time-pos", MPV_FORMAT_DOUBLE, &pos_sec);
         LONGLONG pts = (LONGLONG)(pos_sec * 10000000.0);
 
+        BC(p, "cb (deliver)");
         if (cb) cb(cb_user, buf, w, h, (int)stride, pts);
+        BC(p, "cb returned");
     }
 
     proxy_log("mpv render thread exiting");
@@ -300,32 +320,46 @@ void mpv_player_set_volume_centibels(mpv_player_t *p, long cb) {
 
 void mpv_player_destroy(mpv_player_t *p) {
     if (!p) return;
+    proxy_log("mpv_destroy: enter");
 
     /* Issue #8: silence + stop the file BEFORE terminate_destroy so the
        audio output tears down immediately instead of draining its
        buffer. Without this, BF_Release blocks the game's UI thread for
        100-500 ms on ESC-skip, gating the loading screen. */
     if (p->mpv) {
+        proxy_log("mpv_destroy: pause+stop");
         int yes = 1;
         mpv_set_property(p->mpv, "pause", MPV_FORMAT_FLAG, &yes);
         double zero = 0.0;
         mpv_set_property(p->mpv, "volume", MPV_FORMAT_DOUBLE, &zero);
         const char *stop_cmd[] = { "stop", NULL };
         mpv_command(p->mpv, stop_cmd);
+        proxy_log("mpv_destroy: pause+stop done");
     }
 
+    /* Flip the breadcrumb gate BEFORE signalling, so the render thread
+       starts logging step-by-step on its next iteration. */
+    InterlockedExchange(&p->shutting_down, 1);
     if (p->stop_event)   SetEvent(p->stop_event);
     if (p->update_event) SetEvent(p->update_event); /* wake render thread */
+    proxy_log("mpv_destroy: stop_event signalled");
 
     if (p->render_thread) {
-        WaitForSingleObject(p->render_thread, 5000);
+        proxy_log("mpv_destroy: waiting for render thread (5 s)");
+        DWORD wr = WaitForSingleObject(p->render_thread, 5000);
+        proxy_log("mpv_destroy: wait result = %lu (%s)", wr,
+                  wr == WAIT_OBJECT_0 ? "thread exited" :
+                  wr == WAIT_TIMEOUT  ? "TIMED OUT — thread orphaned" :
+                                        "other");
         CloseHandle(p->render_thread);
     }
     if (p->render) {
+        proxy_log("mpv_destroy: render_context_free");
         mpv_render_context_free(p->render);
         p->render = NULL;
     }
     if (p->mpv) {
+        proxy_log("mpv_destroy: terminate_destroy");
         mpv_terminate_destroy(p->mpv);
         p->mpv = NULL;
     }
@@ -334,4 +368,5 @@ void mpv_player_destroy(mpv_player_t *p) {
     DeleteCriticalSection(&p->cs);
     free(p->bgr0_buf);
     free(p);
+    proxy_log("mpv_destroy: done");
 }

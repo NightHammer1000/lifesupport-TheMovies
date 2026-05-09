@@ -304,8 +304,8 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
            us a poor-man's stack trace without needing StackWalk64. The crash
            cause is almost always one of the return addresses on the stack
            when EIP itself is inside a system DLL (USER32 et al). */
-        proxy_log("  Stack-word module resolution (first 64 DWORDs):");
-        for (int i = 0; i < 64; i++) {
+        proxy_log("  Stack-word module resolution (first 128 DWORDs):");
+        for (int i = 0; i < 128; i++) {
             if (IsBadReadPtr(&stack[i], 4)) break;
             DWORD v = stack[i];
             if (v < 0x10000 || v >= 0x80000000) continue;  /* skip non-code-looking values */
@@ -344,6 +344,19 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
             proxy_log("    %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X %02X %02X %02X %02X",
                       p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
                       p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+        }
+
+        /* Dump 32 bytes around EIP — instruction fingerprint of the USER32
+           function we crashed in. The pipe marks the crash site itself
+           (bytes at EIP), 16 bytes of context on each side. */
+        BYTE *eip_bytes = (BYTE *)(ULONG_PTR)c->Eip;
+        if (eip_bytes && !IsBadReadPtr(eip_bytes - 16, 48)) {
+            BYTE *p = eip_bytes - 16;
+            proxy_log("  Code around EIP (0x%08lX):", c->Eip);
+            proxy_log("    %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X | "
+                      "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                      p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
+                      p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
         }
 
         /* Find what module 0xABCFBB04 is in */

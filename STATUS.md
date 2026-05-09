@@ -423,75 +423,82 @@ once-only flag is replaced by a counter capped at 5.
 
 See `src/main.c::vectored_handler`.
 
-### 6. Render thread blocked in GetBuffer → orphaned past `mpv_player_destroy`'s 5 s wait → corrupted D3D9 teardown
+### 6. Render thread blocked in `Receive` → orphaned past `mpv_player_destroy`'s 5 s wait
 
-**Symptom.** Game launches and menu FMVs play fine. When the user
-clicks past the menu to enter the studio, the game crashes with an
-access violation inside `USER32.dll` writing to `0x0000000C`. The
-USER32 frame is at the bottom of a five-frame call chain entirely
-inside `d3d9.dll` — the game has called into d3d9 (likely
-`IDirect3DDevice9::Reset` for the in-game mode switch) and d3d9 has
-crashed in its own internal teardown. **Vanishes under a Windows
-debugger**: focus / scheduling / heap behaviour shift just enough
-that the renderer's stall doesn't recur.
-
-The pre-crash log shows clean teardown (`FakeGraph destroyed` →
-`DSFilter destroyed`), then **exactly 5 s of silence**, then a stray
-`Pin_Disconnect` + `Pin_Release` from outside our code, then the AV.
+**Symptom.** When an FMV is torn down *mid-playback* (the menu loop
+when the user clicks to enter the studio; the main-menu video when
+the user navigates into the Render Movie menu and back), the next
+playback fails to deliver frames cleanly — visible to the user as
+"menu video doesn't resume after returning from a sub-menu". Pre-fix
+log shows `DSFilter destroyed` followed by **exactly 5 s of silence**
+before `Pin_Disconnect` / `Pin_Release` finally appear.
 
 **Cause.** That 5 s gap is `mpv_player_destroy`'s
 `WaitForSingleObject(p->render_thread, 5000)` timing out. The mpv
-render thread was blocked inside `IMemAllocator::GetBuffer` —
-`GetBuffer` defaults to *infinite* wait when all buffers are in
-flight, and once the renderer stops consuming (mode change,
-ESC-skip, transition between menus) all 4 buffers stay pinned. The
-thread never sees `stop_event` so the wait times out, after which
-`mpv_player_destroy` proceeds anyway, leaving the thread orphaned.
+render thread is stuck inside the deliver path:
 
-The orphan thread eventually unblocks and may still call
-`pin->peer_mem->Receive(...)` against TEXTURERENDERER. Even if it
-doesn't crash directly, it pins TEXTURERENDERER's allocator/sample
-chain (and therefore its D3D9 textures) past the point where the
-game expects the renderer's resources to be free. The next
-`IDirect3DDevice9::Reset` finds resources still held and goes off
-the rails inside d3d9 internals.
+- `IMemAllocator::GetBuffer` defaults to *infinite* wait when all
+  buffers are in flight.
+- Even with NOWAIT on `GetBuffer`, `IMemInputPin::Receive` itself is
+  synchronous and can hang while the renderer is mid-mode-switch.
 
-This was *also* the source of the secondary symptom "menu video
-stops when navigating into the Render Movie menu and back" — the
-previous filter's mpv stayed half-alive, holding TEXTURERENDERER
-state, and the next filter's playback couldn't push frames through.
+Either way the thread never sees `stop_event`, so when the wait
+times out `mpv_player_destroy` proceeds anyway, leaving the thread
+orphaned. The orphan eventually unblocks against a tearing-down
+renderer — undefined behaviour from there.
 
-**Fix (attempt — unverified).** Three coordinated changes:
+Diagnosed concretely via in-thread breadcrumb log lines gated on a
+`shutting_down` flag set by `mpv_player_destroy`. The last
+breadcrumb in the log was `cb (deliver)` followed by no `cb returned`
+— the thread was blocked inside `Receive`, not in mpv internals.
 
-1. `ds_output_pin_deliver` passes `AM_GBF_NOWAIT` (`0x4`) to
-   `GetBuffer`. The render thread now drops the frame instead of
-   blocking when buffers are in flight. Any subsequent
-   `mpv_player_destroy` finds the thread free to observe
-   `stop_event` and exit promptly.
+**Fix.** Three coordinated changes:
 
-2. `BF_Release` clears the mpv frame callback **before** calling
-   `mpv_player_destroy`, so any in-flight render-thread iteration
-   completes without entering `on_mpv_frame` again, and no new
-   iterations call our deliver path.
+1. `BF_Release` calls `IPin::BeginFlush` on each connected peer
+   *before* `mpv_player_destroy`. This is the DirectShow-correct
+   abort signal: tells the renderer to reject pending samples and
+   unblock any in-flight `Receive`. The render thread completes its
+   `cb`, returns to the loop top, observes `stop_event`, exits
+   cleanly. Confirmed via the breadcrumb log: `wait result = 0
+   (thread exited)` instead of `TIMED OUT`.
 
-3. `BF_Release` calls `Pin_Disconnect` *after* `mpv_player_destroy`
-   returns — at that point the render thread is gone, so
-   peer / peer_mem / allocator can be released without racing the
-   render thread, and the renderer can drop its D3D9 textures
-   before the game's next `Reset`.
+2. `ds_output_pin_deliver` passes `AM_GBF_NOWAIT` (`0x4`) to
+   `GetBuffer`. Belt-and-braces with `BeginFlush` — and prevents
+   any future regression where the renderer back-pressures without
+   a flush.
+
+3. `BF_Release` clears the mpv frame callback before
+   `mpv_player_destroy`, then calls `Pin_Disconnect` *after* —
+   peer / peer_mem / allocator are released only once the render
+   thread is gone, so they can't race it.
 
 `pin->filter` is also cleared on destroy and `Pin_QueryPinInfo`
 returns `E_UNEXPECTED` when filter is NULL, in case a stale pin ref
 survives our destruction.
 
-If the d3d9 crash recurs after this, fall back to **Plan B**: hook
-`IDirect3DDevice9::Reset` (vtable slot 16, intercepted by hooking
-`IDirect3D9::CreateDevice` → patch returned device's vtable) and
-force-tear-down all live filters before forwarding to the real
-Reset.
-
 See `src/ds_filter.c::BF_Release`, `src/ds_output_pin.c::Pin_QueryPinInfo`,
 `src/ds_output_pin.c::ds_output_pin_deliver`.
+
+### 7. dgVoodoo2 must wrap its full DLL set, defaults only
+
+Not a code-side gotcha — a **deployment requirement** users hit
+during testing this build.
+
+If users drop dgVoodoo2's `D3D9.dll` alone next to `MoviesSE.exe`,
+the game crashes inside dgVoodoo2's wrapped `d3d9.dll` at the
+in-game-mode transition (deep call chain ending in
+`USER32!some-fn` writing to `0x0000000C`). The wrapper's internal
+interop calls into DDraw / D3D8 / D3DImm don't match expectations
+when those interfaces are still routing through the system DLLs.
+
+**Fix:** ship dgVoodoo2's *full* wrapper set together — `DDraw.dll`,
+`D3D8.dll`, `D3D9.dll`, `D3DImm.dll` — and use the **default**
+`dgVoodooCpl.ini` unmodified. Only safe customisation is the
+watermark.
+
+`release/stage/INSTALL.txt` and the user-facing README call this out
+explicitly so we don't keep getting issues filed for a known
+dgVoodoo2 setup quirk.
 
 ## libmpv quirks worth remembering
 

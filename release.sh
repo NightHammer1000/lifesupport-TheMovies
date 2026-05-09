@@ -63,6 +63,16 @@ existing one and only copy movies_fix.asi + libmpv-2.dll.
 
 Logs go to movies_fix.log in the game directory.
 
+USING WITH dgVoodoo2
+--------------------
+If you also use dgVoodoo2 for graphics (recommended on modern Windows):
+
+  - Drop ALL of dgVoodoo2's wrapper DLLs in together: DDraw.dll,
+    D3D8.dll, D3D9.dll, D3DImm.dll. Wrapping D3D9.dll alone causes a
+    crash inside dgVoodoo2 at the transition into in-game mode.
+  - Keep dgVoodooCpl.ini at its shipped defaults. Only safe edit is
+    the watermark.
+
 VERIFIED SCOPE
 --------------
 This release has been verified to work for launch + main menu navigation.
