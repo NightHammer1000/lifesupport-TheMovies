@@ -1,4 +1,4 @@
-# The Movies — WMF Replacement Mod
+# The Movies — Life Support for Modern Operating Systems
 
 > **Part of the KPC Classics Conservation Program.** See
 > [Conservation Program & AI Disclosure](#conservation-program--ai-disclosure)
