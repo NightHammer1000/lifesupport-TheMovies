@@ -17,20 +17,23 @@ WMF implementation, and the in-game movie studio plus all FMVs depend on
 it. This mod intercepts WMF / DirectShow at the entry points the game uses
 and answers them with a self-contained FFmpeg + libmpv stack.
 
-## Verified scope: launch screens through main menu only
+## Verified scope
 
-> **Important.** Everything below has been verified up to and including
-> the main menu. **Actual in-game play (starting a studio, running the
-> simulation, the campaign) has not been tested yet.** The mod replaces
-> the WMF dependencies the game touches at launch and on the menu —
-> whether further DirectShow / WMF code paths fire during gameplay is
-> unknown. Tracked as an open issue.
+Launch through main menu, full menu navigation, transition into in-game,
+and the export pipeline are all verified. Extended in-game play (running
+a long simulation, the campaign) has not been driven hard yet — file an
+issue if you hit something there.
 
 ## What works (verified)
 
 - **All FMV cutscenes** that play before/around the menu: Activision logo,
   frontend intro, frontend background loop. Clean lip-sync (verified
   against the intro's "3-2-1 beep" countdown).
+- **Menu navigation.** Entering and exiting sub-menus (Movie Player,
+  Options, etc.) correctly pauses and resumes the background loop —
+  matches native `quartz.dll` behaviour.
+- **Transition into in-game** works (with the dgVoodoo2 setup below).
+  ESC-skipping intros no longer stalls the UI.
 - **Audio**: routed through libmpv → WASAPI. No drift, no underruns.
 - **Looping**: only files whose name contains `loop` (i.e. the menu
   background) loop. Intros end naturally and the game progresses.
@@ -51,13 +54,15 @@ and answers them with a self-contained FFmpeg + libmpv stack.
 
 ## Known limitations / TODO
 
-- **In-game gameplay untested.** Only menu-level paths are confirmed
-  ([#9](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/9)).
 - **Movie export improvements** ([#10](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/10),
   [#11](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/11),
   [#12](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/12)):
   switch to MP4+H.264 for universal player compatibility, drive
   encoder bitrate from the captured `IWMProfile`, add audio stream.
+- **Slim FFmpeg static link** ([#7](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/7)).
+  `sync_reader.c` is effectively dead (the in-game editors realtime-render
+  scenes from `.trl` data and never decode video files); a chunk of
+  FFmpeg surface can go with it.
 - **Widescreen** rendering ([#6](https://github.com/NightHammer1000/lifesupport-TheMovies/issues/6)).
   Original ask, not started.
 
@@ -72,6 +77,16 @@ You need three files in the game directory next to `MoviesSE.exe`:
 | `libmpv-2.dll` | [shinchiro mpv-winbuild](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/) — i686 dev archive |
 
 Drop them next to `MoviesSE.exe` and start the game.
+
+### Using with dgVoodoo2 (recommended on modern Windows)
+
+If you also use [dgVoodoo2](http://dege.freeweb.hu/) for graphics fixes:
+
+- Drop **all four** dgVoodoo2 wrapper DLLs together: `DDraw.dll`,
+  `D3D8.dll`, `D3D9.dll`, `D3DImm.dll`. Wrapping `D3D9.dll` alone
+  causes a crash inside dgVoodoo2 at the transition into in-game mode.
+- Keep `dgVoodooCpl.ini` at its shipped defaults. The only safe
+  customisation is the watermark.
 
 ## Build
 
@@ -134,11 +149,13 @@ make clean
                 └─► WASAPI (libmpv internal audio output)
 ```
 
-For the **in-game movie studio** path the game also calls
-`WMCreateSyncReader` and `WMCreateProfileManager` directly. Those go to
-`src/sync_reader.c` and `src/profile_mgr.c` — both FFmpeg-backed. Playback
-of the studio assets happens through the same `DSSourceFilter` path as
-FMVs, so once a file is built it just plays.
+The in-game movie studio (Set / Costume / Timeline / Star management)
+**realtime-renders** scenes from the `.trl` timeline data rather than
+reading any video file — so `WMCreateSyncReader` is effectively never
+hit. `WMCreateProfileManager` is still called by the export path
+(`src/profile_mgr.c`) to load the WMV profiles shipped in the game's
+PAKs. The export captures the engine-rendered frames into our
+`MoviesAsfWriter`.
 
 ## Source layout
 
