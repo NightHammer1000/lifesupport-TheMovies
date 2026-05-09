@@ -2,6 +2,7 @@
 #include "sync_reader.h"
 #include "profile_mgr.h"
 #include "ds_filter.h"
+#include "asf_writer.h"
 #include "ds_fakegraph.h"
 
 #include <MinHook.h>
@@ -138,18 +139,29 @@ static HRESULT WINAPI Hook_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter
         return hr;
     }
 
-    /* Writer-path CLSIDs (movie export). Issue #2 — currently
-       logging-only: we let the request through to the system
-       implementation if it works, otherwise fail. The point of this
-       pass is to confirm the call sequence in the live log so the
-       full short-circuit can be designed. */
+    /* Intercept WM ASF Writer — return our libavformat-backed writer.
+       Same pattern as WMAsfReader → DSSourceFilter (libmpv): we
+       short-circuit qasf.dll entirely so export doesn't depend on the
+       Microsoft component being present or correct on the host. */
+    if (IsEqualGUID(rclsid, &CLSID_WMAsfWriter)) {
+        proxy_log("CoCreateInstance(CLSID_WMAsfWriter) -> MoviesAsfWriter");
+        IBaseFilter_DS *pFilter = NULL;
+        HRESULT hr = mw_writer_create(&pFilter);
+        if (hr < 0) { proxy_log("  create failed: 0x%08lX", hr); return hr; }
+        hr = pFilter->lpVtbl->QueryInterface(pFilter, riid, ppv);
+        pFilter->lpVtbl->Release(pFilter);
+        return hr;
+    }
+
+    /* Other writer-path CLSIDs (CGB2, AsyncReader, WaveParser) still pass
+       through. CGB2 just calls back into our IGraphBuilder, which is
+       fine. */
     const char *known = clsid_name(rclsid);
     if (known &&
         (IsEqualGUID(rclsid, &CLSID_CaptureGraphBuilder2) ||
-         IsEqualGUID(rclsid, &CLSID_WMAsfWriter) ||
          IsEqualGUID(rclsid, &CLSID_AsyncReader) ||
          IsEqualGUID(rclsid, &CLSID_WaveParser))) {
-        proxy_log("CoCreateInstance(%s, riid={%08lX-%04X-%04X}) — passthrough (issue #2)",
+        proxy_log("CoCreateInstance(%s, riid={%08lX-%04X-%04X}) — passthrough",
                   known, riid->Data1, riid->Data2, riid->Data3);
         HRESULT hr = orig_CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
         proxy_log("  -> hr=0x%08lX, ppv=%p", hr, ppv ? *ppv : NULL);
@@ -252,22 +264,25 @@ static void remove_hooks(void) {
 static volatile LONG g_crash_count = 0;
 
 static LONG WINAPI crash_handler(EXCEPTION_POINTERS *ep) {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        /* Skip exceptions inside system DLLs — they use SEH internally */
-        HMODULE hCrashMod = NULL;
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR)ep->ExceptionRecord->ExceptionAddress, &hCrashMod)) {
-            char modname[MAX_PATH];
-            GetModuleFileNameA(hCrashMod, modname, MAX_PATH);
-            /* Only log if it's our ASI or the game EXE, skip system DLLs */
-            if (!strstr(modname, "movies_fix") && !strstr(modname, "MoviesSE")) {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-        }
+    DWORD ec = ep->ExceptionRecord->ExceptionCode;
+    /* Catch fatal hardware exceptions wherever they happen (system DLLs
+       included). Filtering by module hid writer-path crashes that happen
+       deep inside qedit / wmvcore — the log just stopped, looking like a
+       silent exit. Skip noisy software exceptions (C++ throws, RPC) since
+       those are routinely SEH-handled. */
+    BOOL fatal = (ec == EXCEPTION_ACCESS_VIOLATION ||
+                  ec == EXCEPTION_STACK_OVERFLOW ||
+                  ec == EXCEPTION_ILLEGAL_INSTRUCTION ||
+                  ec == EXCEPTION_PRIV_INSTRUCTION ||
+                  ec == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+                  ec == EXCEPTION_ARRAY_BOUNDS_EXCEEDED ||
+                  ec == EXCEPTION_DATATYPE_MISALIGNMENT);
+    if (fatal) {
         LONG count = InterlockedIncrement(&g_crash_count);
         if (count > 5) return EXCEPTION_CONTINUE_SEARCH; /* limit logging */
         CONTEXT *c = ep->ContextRecord;
-        proxy_log("!!! CRASH #%ld: Access Violation at EIP=0x%08lX (thread=%lu) !!!", count, c->Eip, GetCurrentThreadId());
+        proxy_log("!!! CRASH #%ld: code=0x%08lX at EIP=0x%08lX (thread=%lu) !!!",
+                  count, ec, c->Eip, GetCurrentThreadId());
         proxy_log("  EAX=%08lX EBX=%08lX ECX=%08lX EDX=%08lX",
                   c->Eax, c->Ebx, c->Ecx, c->Edx);
         proxy_log("  ESI=%08lX EDI=%08lX EBP=%08lX ESP=%08lX",
