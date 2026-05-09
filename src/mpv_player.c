@@ -301,6 +301,19 @@ void mpv_player_set_volume_centibels(mpv_player_t *p, long cb) {
 void mpv_player_destroy(mpv_player_t *p) {
     if (!p) return;
 
+    /* Issue #8: silence + stop the file BEFORE terminate_destroy so the
+       audio output tears down immediately instead of draining its
+       buffer. Without this, BF_Release blocks the game's UI thread for
+       100-500 ms on ESC-skip, gating the loading screen. */
+    if (p->mpv) {
+        int yes = 1;
+        mpv_set_property(p->mpv, "pause", MPV_FORMAT_FLAG, &yes);
+        double zero = 0.0;
+        mpv_set_property(p->mpv, "volume", MPV_FORMAT_DOUBLE, &zero);
+        const char *stop_cmd[] = { "stop", NULL };
+        mpv_command(p->mpv, stop_cmd);
+    }
+
     if (p->stop_event)   SetEvent(p->stop_event);
     if (p->update_event) SetEvent(p->update_event); /* wake render thread */
 
