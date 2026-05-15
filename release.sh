@@ -75,10 +75,13 @@ If you also use dgVoodoo2 for graphics (recommended on modern Windows):
 
 VERIFIED SCOPE
 --------------
-This release has been verified to work for launch + main menu navigation.
+This release has been verified to work for launch + main menu navigation
++ movie export (Render Movie). Movies export as MP4 / H.264 / AAC with
+correct audio + video sync. The file is named .mp4 on disk even though
+the game's UI still calls it .wmv internally.
+
 Actual in-game play (starting a studio, the campaign, the simulation)
-has NOT been tested yet. Movie export writes a real .wmv but the encoded
-output may show codec artifacts — fix in progress.
+has NOT been tested yet.
 
 If you hit a problem during gameplay, please file an issue with your
 movies_fix.log attached.
