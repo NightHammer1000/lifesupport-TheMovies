@@ -12,12 +12,27 @@ frontend intro, frontend background loop — with clean audio/video sync
 (libmpv-paced). The game progresses past intros naturally; the menu
 file is the only one that loops.
 
-**Movie export works end-to-end.** `CLSID_WMAsfWriter` is intercepted
-in `main.c` and answered by `MoviesAsfWriter` (`src/asf_writer.c`) —
-an in-process IBaseFilter + IFileSinkFilter + IConfigAsfWriter + input
-pin, backed by libavformat (ASF muxer) and libavcodec (WMV2). Output
-is a clean `.wmv` that VLC reads. No qasf.dll / wmvcore.dll / qcap.dll
-dependency at runtime.
+**Movie export works end-to-end and produces MP4 / H.264 / AAC.**
+`CLSID_WMAsfWriter` is intercepted in `main.c` and answered by
+`MoviesAsfWriter` (`src/asf_writer.c`) — an in-process IBaseFilter +
+IFileSinkFilter + IConfigAsfWriter + two input pins, backed by
+libavformat (mp4/mov muxer) and libavcodec (libopenh264 + AAC native).
+Despite the class identity it advertises, the file it writes is MP4 —
+`FS_SetFileName` rewrites the trailing `.wmv` → `.mp4`. No qasf.dll /
+wmvcore.dll / qcap.dll dependency at runtime. Licensing is LGPL-clean:
+no `--enable-gpl`, OpenH264 carries Cisco's patent coverage, AAC is
+FFmpeg's native LGPL encoder.
+
+Video is paced from the sample's REFERENCE_TIME (the game's render
+thread can't sustain real-time 30 fps during export and would otherwise
+produce an output that runs ~1.4× too fast against the audio track —
+H.264 in MP4 accepts variable per-frame durations natively). Audio is
+read directly from the pre-pass TMP wav rather than through the
+in-graph audio chain: the game's Wave Dest filter writes the WAV with
+a broken `data_chunk_size` header field (placeholder ~1 GB, never
+seeked-and-updated on Stop) that confused every downstream MSADPCM/
+WMA2 path we tried; reading the raw PCM body and trusting file size
+sidesteps the whole class of problem.
 
 Two notable forks during development, both reflected in commit history:
 
@@ -44,15 +59,10 @@ DirectShow paths fire during gameplay is unknown — tracked as #9.
 Open work:
 1. **In-game gameplay verification** (#9) — verified scope ends at the
    main menu.
-2. Movie export enhancements:
-   - #10 — switch container/codec to MP4 + H.264 for universal
-     compatibility (we're not bound to WMV; the game doesn't play
-     exports back in-engine — it re-renders previews from scene data).
-   - #11 — drive encoder `bit_rate` from the captured IWMProfile.
-   - #12 — audio stream support (writer is currently video-only).
-3. Widescreen rendering — not started (#6).
-4. Trim FFmpeg dependency (#7): `sync_reader.c` and `asf_writer.c` are
-   the only consumers; a smaller static FFmpeg is feasible.
+2. Widescreen rendering — not started (#6).
+3. Trim FFmpeg dependency further (#7) — `ffmpeg_rebuild.sh` already
+   strips decoders/demuxers/HW-accel; further pruning is possible if
+   we drop swresample/swscale (only swresample is actually called).
 
 ## Architecture
 
@@ -106,7 +116,7 @@ its scheduler.
 
 | File | Purpose |
 | --- | --- |
-| `src/main.c` | ASI entry, MinHook hooks (`LoadLibraryA/W`, `GetProcAddress`, `CoCreateInstance`, `FUN_009ed380`), vectored exception logger. |
+| `src/main.c` | ASI entry, MinHook hooks (`LoadLibraryA/W`, `GetProcAddress`, `CoCreateInstance` — all Windows APIs, no direct game addresses), vectored exception logger. |
 | `src/log.c/h` | `proxy_log()` → `movies_fix.log`, flushed each line. |
 | `src/trace.h` | `TRACE_MSG` for COM-stub spam. |
 | `src/ds_types.h`, `src/wm_types.h` | Vtable structs + IIDs/CLSIDs (we don't link the Windows SDK ones). |
@@ -127,7 +137,7 @@ Ghidra base `0x00400000`.
 | --- | --- |
 | `0x00d73ea4` | FMV Player C++ vtable. `[2]` Open, `[6]` per-frame play tick, `[10]` IsFinished. |
 | `0x009EE690` | Per-frame play tick — calls a callback dispatcher then `FUN_009ed380`. |
-| `0x009ED380` | "PlayVideo" — hooked for diagnostics. Operates on the *playback controller*, not the FMV Player. |
+| `0x009ED380` | "PlayVideo" — operates on the *playback controller*, not the FMV Player. (Was hooked during menu-crash debugging; hook removed in #14 to keep the mod binary-version agnostic.) |
 | `0x009EDD80` | Callback invoked with the FMV Player as context. Calls vtable[11] then vtable[10] (IsFinished); on finished, tail-jumps vtable[7]. |
 | `0x009EDDE0` | `FMVPlayer_IsFinished` → `FUN_009ed5a0(playback_controller)`. |
 | `0x009ED5A0` | `IsVideoFinished` — only honours states 1 and 2; other states report finished. |
@@ -479,7 +489,41 @@ survives our destruction.
 See `src/ds_filter.c::BF_Release`, `src/ds_output_pin.c::Pin_QueryPinInfo`,
 `src/ds_output_pin.c::ds_output_pin_deliver`.
 
-### 7. dgVoodoo2 must wrap its full DLL set, defaults only
+### 7. Wave Dest writes a broken WAV header for the pre-pass TMP file
+
+The game's audio export is a two-pass pipeline: first a pre-pass writes
+all audio to a TMP wav (`<savepath>\TMP%04d.wav`), then the encode pass
+reads that wav via `AsyncReader` + `WaveParser` and feeds it to the
+writer. The pre-pass uses DirectShow's `WavDest` filter with a real
+`CLSID_FileWriter` from `quartz.dll`.
+
+`WavDest` writes a placeholder header at start (`data_chunk_size`
+typically `1031561588`, i.e., ~1 GB), expecting to seek back and patch
+it during `Stop`. With our `FakeGraph` orchestrating the pre-pass
+graph, the seek-and-patch step doesn't land — the resulting file has
+correct PCM in the body but `data_chunk_size` still says ~1 GB. Any
+downstream parser that trusts that field (Microsoft's `WaveParser`,
+our earlier MSADPCM passthrough, libavformat's `wav` demuxer) reads
+past the real end of audio and produces minutes of silence + buffer
+noise.
+
+**Fix:** bypass the in-graph audio chain entirely. `asf_writer.c` opens
+the TMP wav directly via the `CAviSyst` global at `0x010bab18` (object
+base, path at +0x210), reads RIFF/WAVE chunks itself, trusts file size
+rather than `data_chunk_size`, and transcodes PCM → AAC up front
+before any video frames stream in. The audio pin still accepts MSADPCM
+connections so the game's graph builder is satisfied, but
+`MIP_Receive` for audio just returns `S_OK` and drops the samples.
+
+The direct-address access is version-specific (violates #14's
+properties) but contained to one function and acceptable because the
+alternative would be reimplementing `WavDest`'s seek-on-Stop
+contract — a much larger surface area for the same end result.
+
+See `src/asf_writer.c::locate_prepass_wav_path` /
+`::wav_open_info` / `::wav_encode_to_aac`.
+
+### 8. dgVoodoo2 must wrap its full DLL set, defaults only
 
 Not a code-side gotcha — a **deployment requirement** users hit
 during testing this build.
@@ -515,12 +559,19 @@ dgVoodoo2 setup quirk.
 
 ## Build / deploy
 
-`build.sh` and `deploy.sh` are the canonical scripts (the old Makefile
-was removed because pkg-config silently picked up the wrong FFmpeg). See
-the README for prerequisites and one-liner usage.
+`make` is canonical (`Makefile`). `make deploy` copies the ASI and
+`libmpv-2.dll` to the game dir; `make info` shows the resolved DLL
+imports of the built ASI. `build.sh` mirrors the same compile/link
+recipe for environments where make isn't convenient.
 
-The output ASI imports only:
+FFmpeg is statically linked with a tailored feature set
+(`ffmpeg_rebuild.sh`): libopenh264 + AAC encoders, mp4/mov muxers,
+swscale, swresample, nothing else. No decoders, demuxers, HW accel,
+postproc, filters, avdevice, or network protocols. `-static-libgcc
+-static-libstdc++` plus an explicit `-lstdc++ -lsupc++` in the static
+group fold the C++ runtime libopenh264 pulls in into the ASI itself,
+so we don't ship libgcc / libstdc++ DLLs alongside.
+
+The output ASI (~4.3 MB) imports only:
 - `KERNEL32.dll`, `msvcrt.dll`, `ole32.dll`, `bcrypt.dll` — system.
 - `libmpv-2.dll` — shipped alongside the ASI.
-
-FFmpeg is statically linked.
