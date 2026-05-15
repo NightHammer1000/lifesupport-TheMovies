@@ -83,6 +83,7 @@ i686-w64-mingw32-gcc -m32 -shared -static-libgcc \
         -lavformat -lavcodec -lswscale -lswresample -lavutil \
         -lz -lwinpthread \
     -Wl,-Bdynamic \
+        -lopenh264 \
         -L"$MPV_DIR" -lmpv \
         -lole32 -loleaut32 -luuid -lws2_32 -lbcrypt -lm -lsecur32 -lwinmm
 

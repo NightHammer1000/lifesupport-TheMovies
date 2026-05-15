@@ -292,6 +292,16 @@ static HRESULT STDMETHODCALLTYPE FG_AddFilter(IBaseFilter_DS *This, IBaseFilter_
 
     /* Tell the filter it joined this graph */
     pFilter->lpVtbl->JoinFilterGraph(pFilter, (IFilterGraph_DS*)g, pName);
+
+    /* Real quartz.dll IFilterGraph calls SetSyncSource on each filter as
+       part of normal lifecycle — clock starts as default system clock,
+       graph manager passes it in. Our shim skips this. Some filters
+       (Wave Dest in particular) appear to not properly arm their data
+       path until SetSyncSource is called at least once, which manifests
+       as the export's audio chain producing no real data. Passing NULL
+       (no clock) is what's expected for offline / max-speed encode and
+       is what the per-filter SetSyncSource handlers handle. */
+    pFilter->lpVtbl->SetSyncSource(pFilter, NULL);
     return S_OK;
 }
 
@@ -501,13 +511,19 @@ static HRESULT STDMETHODCALLTYPE MC_Run(void *This) {
     /* Skip if already running — game calls this every frame */
     if (g->running) return S_OK;
     TRACE_MSG("FG::MC::Run() src=%p renderer=%p", g->source_filter, g->video_renderer);
-    for (int i = 0; i < g->filter_count; i++) {
+    /* Reverse order (sinks first, sources last) per DirectShow convention.
+       Critical for the export path: if Video Source / Audio Enc are Paused
+       before our MwWriter, they start producing samples and call Receive
+       on us before our BF_Pause has run writer_open_encoder. The lock in
+       writer_open_encoder serializes that race; this ordering eliminates
+       it almost entirely. */
+    for (int i = g->filter_count - 1; i >= 0; i--) {
         if (g->filters[i]) {
             TRACE_MSG("  Pause filter[%d]=%p", i, g->filters[i]);
             g->filters[i]->lpVtbl->Pause(g->filters[i]);
         }
     }
-    for (int i = 0; i < g->filter_count; i++) {
+    for (int i = g->filter_count - 1; i >= 0; i--) {
         if (g->filters[i]) {
             TRACE_MSG("  Run filter[%d]=%p", i, g->filters[i]);
             g->filters[i]->lpVtbl->Run(g->filters[i], 0);
@@ -522,7 +538,8 @@ static HRESULT STDMETHODCALLTYPE MC_Run(void *This) {
 static HRESULT STDMETHODCALLTYPE MC_Pause(void *This) {
     FakeGraph *g = GRAPH_FROM_MC(This);
     TRACE_MSG("FG::MC::Pause()");
-    for (int i = 0; i < g->filter_count; i++)
+    /* Reverse order — sinks first per DirectShow convention. */
+    for (int i = g->filter_count - 1; i >= 0; i--)
         if (g->filters[i]) g->filters[i]->lpVtbl->Pause(g->filters[i]);
     /* Clear running so a subsequent MC_Run actually fires. The game uses
        Pause when navigating into a sub-menu (e.g. Movie Player) and Run
@@ -582,7 +599,55 @@ static HRESULT STDMETHODCALLTYPE MC_get_RegFilterCollection(void *t, void **pp) 
     return E_NOTIMPL;
 }
 static HRESULT STDMETHODCALLTYPE MC_StopWhenReady(void *t) {
-    proxy_log("FG::MC::StopWhenReady()");
+    FakeGraph *g = GRAPH_FROM_MC(t);
+    proxy_log("FG::MC::StopWhenReady() — waiting for source completion then Stop'ing %d filters", g->filter_count);
+
+    /* Per MSDN, StopWhenReady should block until the graph's renderers
+       have processed all pending data (signaled via EC_COMPLETE on the
+       graph's IMediaEventSink), then stop the graph.
+
+       The game's audio pre-pass — Movies Audio Source → Wave Dest →
+       File Writer — relies on this. The source pre-allocates a WAV
+       buffer for the maximum supported movie length (~21 minutes) and
+       fills it on a worker thread; the actual content is only the
+       first ~Nms of the movie's duration. If we Stop before the
+       worker finishes, File Writer closes the file with the FULL
+       allocated header but only partial data, leaving the rest as
+       garbage/zeros. The next phase's AsyncReader on that WAV reads
+       all 21 minutes of (mostly silent) data, the audio compressor
+       turns it into MSADPCM, we mux it, and the output WMV ends up
+       21 min of silence with periodic ADPCM artifacts.
+
+       Try the spec-compliant wait on complete_event first (some
+       renderers will notify; the audio pre-pass's File Writer empirically
+       does not — we'd just time out). The fallback Sleep is the
+       practical workaround. 5 seconds is a heuristic that covers
+       short-to-medium movies; longer ones may still truncate, which
+       we'll have to revisit if it bites. */
+    /* The audio pre-pass's render is SYNCHRONOUS inside CAviSyst's own
+       AudioSource_RenderUntilStop call (loops on FUN_00c94800 until the
+       source's internal position reaches the stop value). By the time
+       the game gets here, the render is already complete and samples
+       have been delivered to Wave Dest. Just Stop, no wait needed. */
+    (void)g;
+
+    /* SOURCE-FIRST order. For the audio pre-pass, Wave Dest needs to
+       seek-and-update the WAV header during its Stop (the "data_chunk_size"
+       field), which requires File Writer to still be alive to receive
+       the write. Stopping File Writer first closed the file before Wave
+       Dest could finalize, leaving the header's data_chunk_size as
+       garbage (~1 GB placeholder), which made the next phase's WaveParser
+       read past EOF as silence. */
+    if (!g->source_filter) {
+        for (int i = 0; i < g->filter_count; i++) {
+            if (g->filters[i]) {
+                proxy_log("  Stop filter[%d]=%p", i, g->filters[i]);
+                g->filters[i]->lpVtbl->Stop(g->filters[i]);
+            }
+        }
+    }
+
+    g->running = FALSE;
     return S_OK;
 }
 
@@ -625,9 +690,21 @@ static HRESULT STDMETHODCALLTYPE ME_GetEvent(void *t, long *code, LONG_PTR *p1, 
     return E_ABORT;
 }
 static HRESULT STDMETHODCALLTYPE ME_WaitForCompletion(void *t, long ms, long *pEvCode) {
-    proxy_log("FG::ME::WaitForCompletion(ms=%ld)", ms);
+    FakeGraph *g = GRAPH_FROM_ME(t);
+    /* Actually wait on complete_event for up to ms. If a renderer
+       notifies EC_COMPLETE within that window, return success.
+       Otherwise return E_ABORT-ish so the caller can poll again or
+       proceed (matches DirectShow behavior on timeout). */
+    DWORD timeout = (ms < 0) ? INFINITE : (DWORD)ms;
+    DWORD wr = g->complete_event
+               ? WaitForSingleObject(g->complete_event, timeout)
+               : WAIT_TIMEOUT;
+    if (wr == WAIT_OBJECT_0) {
+        if (pEvCode) *pEvCode = EC_COMPLETE;
+        return S_OK;
+    }
     if (pEvCode) *pEvCode = 0;
-    return S_OK;
+    return E_ABORT;  /* timeout — VFW_E_WRONG_STATE not in our headers; E_ABORT is the spec-allowed timeout return */
 }
 /* CRITICAL: each slot stub must have the EXACT real-method signature so
    __stdcall callee-cleanup pops the right number of bytes. Variadic

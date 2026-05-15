@@ -65,10 +65,14 @@ CFLAGS := -m32 -O2 -Wall \
           -DWIN32_LEAN_AND_MEAN \
           -MMD -MP
 
-LDFLAGS := -m32 -shared -static-libgcc
+# -static-libstdc++ folds the C++ runtime into the ASI so we don't ship
+# libstdc++-6.dll alongside. Same for libgcc. openh264.a is C++, hence
+# the libstdc++ dependency.
+LDFLAGS := -m32 -shared -static-libgcc -static-libstdc++
 
-LDLIBS  := -L$(FFDIR)/lib -Wl,-Bstatic \
+LDLIBS  := -L$(FFDIR)/lib -L/c/msys64/mingw32/lib -Wl,-Bstatic \
                -lavformat -lavcodec -lswscale -lswresample -lavutil \
+               -lopenh264 -lstdc++ -lsupc++ \
                -lz -lwinpthread \
            -Wl,-Bdynamic \
                -L$(MPVDIR) -lmpv \
