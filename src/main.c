@@ -174,50 +174,11 @@ static HRESULT WINAPI Hook_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter
 }
 
 /* ================================================================
- * Game function hook — intercept FUN_009ed380 (PlayVideo) for diagnosis
- * ================================================================ */
-
-typedef BOOL (__thiscall *pfn_PlayVideo)(void *this_ptr);
-static pfn_PlayVideo orig_PlayVideo = NULL;
-
-static BOOL __fastcall Hook_PlayVideo(void *this_ptr, void *edx_unused) {
-    DWORD *obj = (DWORD*)this_ptr;
-    proxy_log("=== Hook_PlayVideo(this=%p) thread=%lu ===", this_ptr, GetCurrentThreadId());
-    if (!IsBadReadPtr(obj, 0x24)) {
-        proxy_log("  [0x00] IGraphBuilder = %p", (void*)obj[0]);
-        proxy_log("  [0x04] IMediaControl = %p", (void*)obj[1]);
-        proxy_log("  [0x08] IMediaSeeking = %p", (void*)obj[2]);
-        proxy_log("  [0x0C] IMediaPosition = %p", (void*)obj[3]);
-        proxy_log("  [0x10] IBasicAudio   = %p", (void*)obj[4]);
-        proxy_log("  [0x14] sub_object    = %p", (void*)obj[5]);
-        proxy_log("  [0x18] field_18      = %08lX", obj[6]);
-        proxy_log("  [0x1C] state         = %08lX", obj[7]);
-        /* Dump vtable of IMediaSeeking if non-null */
-        if (obj[2] && !IsBadReadPtr((void*)obj[2], 4)) {
-            DWORD *ms_obj = (DWORD*)obj[2];
-            DWORD *ms_vtbl = (DWORD*)ms_obj[0];
-            proxy_log("  IMediaSeeking->vtbl = %p", ms_vtbl);
-            if (ms_vtbl && !IsBadReadPtr(ms_vtbl, 0x24)) {
-                proxy_log("    vtbl[0x1c]=%p vtbl[0x20]=%p", (void*)ms_vtbl[7], (void*)ms_vtbl[8]);
-            }
-        }
-        /* Dump vtable of IMediaControl if non-null */
-        if (obj[1] && !IsBadReadPtr((void*)obj[1], 4)) {
-            DWORD *mc_obj = (DWORD*)obj[1];
-            DWORD *mc_vtbl = (DWORD*)mc_obj[0];
-            proxy_log("  IMediaControl->vtbl = %p", mc_vtbl);
-            if (mc_vtbl && !IsBadReadPtr(mc_vtbl, 0x20)) {
-                proxy_log("    vtbl[0x1c]=%p", (void*)mc_vtbl[7]);
-            }
-        }
-    }
-    BOOL result = orig_PlayVideo(this_ptr);
-    proxy_log("  PlayVideo returned %d", result);
-    return result;
-}
-
-/* ================================================================
  * Hook installation / removal
+ *
+ * All production hooks target Windows APIs (LoadLibrary*, GetProcAddress,
+ * CoCreateInstance) — no game-binary addresses. The mod stays version-
+ * agnostic across MoviesSE.exe revisions.
  * ================================================================ */
 
 static BOOL install_hooks(void) {
@@ -239,11 +200,6 @@ static BOOL install_hooks(void) {
 
     s = MH_CreateHookApi(L"ole32", "CoCreateInstance", (LPVOID)Hook_CoCreateInstance, (LPVOID *)&orig_CoCreateInstance);
     if (s != MH_OK) { proxy_log("Hook CoCreateInstance failed: %d", s); return FALSE; }
-
-    /* Hook game's PlayVideo function at 0x009ED380 for crash diagnosis */
-    s = MH_CreateHook((LPVOID)0x009ED380, (LPVOID)Hook_PlayVideo, (LPVOID *)&orig_PlayVideo);
-    if (s != MH_OK) { proxy_log("Hook PlayVideo failed: %d", s); }
-    else { proxy_log("Hooked PlayVideo @ 0x009ED380"); }
 
     s = MH_EnableHook(MH_ALL_HOOKS);
     if (s != MH_OK) { proxy_log("MH_EnableHook failed: %d", s); return FALSE; }
